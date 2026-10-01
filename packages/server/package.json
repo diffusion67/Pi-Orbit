@@ -48,7 +48,6 @@
 	},
 	"dependencies": {
 		"@earendil-works/chord": "^0.99.2",
-		"@earendil-works/pi-agent-core": "^0.99.2",
 		"@earendil-works/pi-protocol": "^0.99.2"
 	},
 	"devDependencies": {
