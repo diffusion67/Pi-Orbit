@@ -180,6 +180,31 @@ try {
 	await waitFor(async () => (await cdp.evaluate("document.documentElement.lang")) === "zh-CN", "Chinese desktop language");
 	const session = assertOk(await invoke(cdp, "session.create", { projectId: project.id, model: "orbit-smoke/smoke" }), "create faux-model session");
 	console.log("Installed smoke: session created");
+	await cdp.evaluate("document.querySelector('.rename-session-button').click()");
+	await waitFor(async () => (await cdp.evaluate("Boolean(document.querySelector('.session-rename input'))")) === true, "session rename form");
+	const longTitle = "Long session title ".repeat(12).slice(0, 200);
+	await setFieldValue(cdp, ".session-rename input", longTitle);
+	await cdp.evaluate("document.querySelector('.session-rename').requestSubmit()");
+	await waitFor(async () => (await cdp.evaluate("document.querySelector('.conversation-head h1')?.textContent")) === longTitle, "long session title");
+	const titleFits = await cdp.evaluate("document.querySelector('.conversation-head h1').getBoundingClientRect().right <= document.querySelector('.conversation-actions').getBoundingClientRect().left");
+	if (!titleFits) throw new Error("A long session title overlaps conversation actions");
+	await cdp.evaluate("document.querySelector('.rename-session-button').click()");
+	await waitFor(async () => (await cdp.evaluate("Boolean(document.querySelector('.session-rename input'))")) === true, "reopened session rename form");
+	await setFieldValue(cdp, ".session-rename input", "Orbit smoke renamed session");
+	await cdp.evaluate("document.querySelector('.session-rename').requestSubmit()");
+	await waitFor(async () => assertOk(await invoke(cdp, "app.snapshot"), "renamed session").sessions.some((item) => item.id === session.id && item.title === "Orbit smoke renamed session"), "persisted session name");
+	await setFieldValue(cdp, ".session-search", "definitely-no-matching-session");
+	await waitFor(async () => (await cdp.evaluate("document.querySelectorAll('.session-row').length")) === 0, "empty session search");
+	await setFieldValue(cdp, ".session-search", "SMOKE RENAMED");
+	await waitFor(async () => (await cdp.evaluate("document.querySelectorAll('.session-row').length")) === 1, "case-insensitive session search");
+	await setFieldValue(cdp, ".session-search", "");
+	await setFieldValue(cdp, ".composer textarea", "orbit-first-draft");
+	const otherSession = assertOk(await invoke(cdp, "session.create", { projectId: project.id, model: "orbit-smoke/smoke" }), "create second draft session");
+	await waitFor(async () => (await cdp.evaluate("document.querySelector('.composer textarea')?.value")) === "", "new session has its own draft");
+	await setFieldValue(cdp, ".composer textarea", "orbit-second-draft");
+	assertOk(await invoke(cdp, "session.select", { sessionId: session.id }), "restore first session draft");
+	await waitFor(async () => (await cdp.evaluate("document.querySelector('.composer textarea')?.value")) === "orbit-first-draft", "first draft restored after switching");
+	console.log("Installed smoke: session search, rename, and independent drafts verified");
 	await cdp.evaluate("window.__piOrbitDiagnostics = []; window.piOrbit.subscribe(0, event => { if (event.type === 'diagnostic') window.__piOrbitDiagnostics.push({ code: event.code, message: event.message }); })");
 	await waitFor(async () => (await cdp.evaluate("Boolean(document.querySelector('.composer textarea:not([disabled])'))")) === true, "active conversation composer");
 	await cdp.evaluate(`(() => {
@@ -226,6 +251,7 @@ try {
 	await waitFor(() => calls.some((request) => JSON.stringify(request).includes("orbit-task-recovery-probe")), "task request reached local faux provider");
 	if (calls.length !== 2) throw new Error(`Expected exactly 2 local model requests before restart; got ${calls.length}`);
 	console.log("Installed smoke: child task started");
+	await setFieldValue(cdp, ".composer textarea", "orbit-restored-draft");
 	await closeApp(cdp, appProcess);
 	cdp = undefined;
 	appProcess = undefined;
@@ -247,6 +273,16 @@ try {
 			restored.providers.some((item) => item.id === "openai" && item.configured) &&
 			restored.roles.some((item) => item.id === role.id);
 	}, "recovery of task, session, project, settings, auth, and role");
+
+	if (!assertOk(await invoke(cdp, "app.snapshot"), "restored session name").sessions.some((item) => item.id === session.id && item.title === "Orbit smoke renamed session")) throw new Error("Session rename was lost after restart");
+	await waitFor(async () => (await cdp.evaluate("document.querySelector('.composer textarea')?.value")) === "orbit-restored-draft", "first text draft restored after restart");
+	assertOk(await invoke(cdp, "session.select", { sessionId: otherSession.id }), "restore second session after restart");
+	await waitFor(async () => (await cdp.evaluate("document.querySelector('.composer textarea')?.value")) === "orbit-second-draft", "second text draft restored after restart");
+	assertOk(await invoke(cdp, "session.select", { sessionId: session.id }), "reselect original session after draft verification");
+	await waitFor(async () => (await cdp.evaluate("document.querySelector('.composer textarea')?.value")) === "orbit-restored-draft", "original draft remains isolated");
+	const screenshot = await cdp.send("Page.captureScreenshot", { format: "png" });
+	await writeFile(join(process.cwd(), "packages/desktop/release/ui-smoke.png"), Buffer.from(screenshot.data, "base64"));
+	console.log("Installed smoke: renamed sessions and text drafts survive restart");
 	await delay(1500);
 	if (calls.length !== 2) throw new Error(`Application replayed an interrupted model request after restart (request count ${calls.length})`);
 	console.log("Installed Pi Orbit API smoke passed: terminal, local faux conversation, auth/settings/session/project-role persistence, task recovery, and no interrupted request replay.");
@@ -312,6 +348,16 @@ async function invoke(connection, command, payload) {
 function assertOk(result, operation) {
 	if (!result?.ok) throw new Error(`${operation} failed: ${result?.code ?? "UNKNOWN"} ${result?.message ?? ""}`);
 	return result.data;
+}
+
+async function setFieldValue(connection, selector, value) {
+	await connection.evaluate(`(() => {
+		const field = document.querySelector(${JSON.stringify(selector)});
+		if (!field) throw new Error('Input field is unavailable');
+		const prototype = field.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+		Object.getOwnPropertyDescriptor(prototype, 'value').set.call(field, ${JSON.stringify(value)});
+		field.dispatchEvent(new Event('input', { bubbles: true }));
+	})()`);
 }
 
 async function selectSettingsOption(connection, value) {

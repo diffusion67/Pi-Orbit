@@ -15,6 +15,7 @@ export const desktopCommandSchemas = {
 	"project.open": object({ path }),
 	"project.create": object({ path, name: Type.String({ minLength: 1, maxLength: 200 }) }),
 	"session.select": object({ sessionId: identifier }),
+	"session.rename": object({ sessionId: identifier, title: Type.String({ minLength: 1, maxLength: 200 }) }),
 	"session.create": object({ projectId: identifier, model: Type.Optional(identifier) }),
 	"session.prompt": object({
 		sessionId: identifier,

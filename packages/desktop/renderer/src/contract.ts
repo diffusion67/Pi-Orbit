@@ -79,7 +79,7 @@ export type AppSnapshot = {
 		sendShortcut: "enter" | "ctrlEnter";
 	};
 	features: { terminal: boolean; desktopExtensions: boolean };
-	terminal?: { id: string; title: string; state: "starting" | "running" | "exited"; output: string };
+	terminal?: { id: string; title: string; state: "starting" | "running" | "exited"; output: string; outputOffset?: number };
 	capabilities: Record<string, { available: boolean; diagnostic?: string }>;
 };
 export type DesktopEvent =
@@ -102,6 +102,7 @@ export type CommandMap = {
 	"project.open": { payload: { path: string }; data: Project };
 	"project.create": { payload: { path: string; name: string }; data: Project };
 	"session.select": { payload: { sessionId: string }; data: Session };
+	"session.rename": { payload: { sessionId: string; title: string }; data: Session };
 	"session.create": { payload: { projectId: string; model?: string }; data: Session };
 	"session.prompt": { payload: { sessionId: string; text: string; attachments?: DesktopAttachment[] }; data: { accepted: true } };
 	"session.message": { payload: { sessionId: string; text: string; deliverAs: "steer" | "followUp"; attachments?: DesktopAttachment[] }; data: { accepted: true; delivery: "steer" | "followUp" } };

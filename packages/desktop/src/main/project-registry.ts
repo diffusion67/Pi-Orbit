@@ -121,7 +121,7 @@ export class ProjectRegistry {
 			`INSERT INTO desktop_sessions (id, project_id, file, title, updated_at, model, status)
 			VALUES (?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, file=excluded.file,
-				title=excluded.title, updated_at=excluded.updated_at, model=excluded.model, status=excluded.status`,
+				updated_at=excluded.updated_at, model=excluded.model, status=excluded.status`,
 			session.id,
 			session.projectId,
 			session.file,
@@ -129,6 +129,16 @@ export class ProjectRegistry {
 			session.updatedAt,
 			session.model,
 			session.status,
+		);
+	}
+
+	/** Explicit title updates prevent stale worker state from overwriting a user rename. */
+	async renameSession(id: string, title: string): Promise<void> {
+		await this.db.run(
+			"UPDATE desktop_sessions SET title = ?, updated_at = ? WHERE id = ?",
+			title,
+			new Date().toISOString(),
+			id,
 		);
 	}
 

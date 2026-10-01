@@ -159,5 +159,6 @@ jobs:
           path: |
             ${{ matrix.artifact_glob }}
             packages/desktop/release/SHA256SUMS
+            packages/desktop/release/ui-smoke.png
           if-no-files-found: error
           retention-days: 14
