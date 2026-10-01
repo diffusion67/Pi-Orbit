@@ -1,0 +1,20 @@
+{
+	"extends": "../../tsconfig.base.json",
+	"compilerOptions": {
+		"rootDir": "src",
+		"outDir": "dist",
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		"types": ["node", "electron"],
+		"paths": {
+			"@earendil-works/chord": ["../chord/dist/index.d.ts"],
+			"@earendil-works/pi-agent-core": ["../agent/dist/index.d.ts"],
+			"@earendil-works/pi-ai": ["../ai/dist/index.d.ts"],
+			"@earendil-works/pi-coding-agent": ["../coding-agent/dist/index.d.ts"],
+			"@earendil-works/pi-durable/storage/sqlite": ["../durable/dist/storage/sqlite/index.d.ts"],
+			"@earendil-works/pi-durable/storage/sqlite/node": ["../durable/dist/storage/sqlite/node.d.ts"],
+			"@earendil-works/pi-tui": ["../tui/dist/index.d.ts"]
+		}
+	},
+	"include": ["src/**/*.ts"]
+}

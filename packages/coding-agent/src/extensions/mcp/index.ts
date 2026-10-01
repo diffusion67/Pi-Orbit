@@ -29,7 +29,8 @@
 import { join, resolve } from "node:path";
 import { hyperlink, type SelectItem } from "@earendil-works/pi-tui";
 import type { TSchema } from "typebox";
-import { getAgentDir } from "../../config.ts";
+import { CONFIG_DIR_NAME, getAgentDir } from "../../config.ts";
+import { FileAuthStorageBackend } from "../../core/auth-storage.ts";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -37,18 +38,21 @@ import type {
 	ExtensionFactory,
 	ToolDefinition,
 } from "../../core/extensions/types.ts";
-import { mcpNamespace } from "../../core/mcp-servers.ts";
+import { mcpNamespace, validateMcpServerConfig } from "../../core/mcp-servers.ts";
 import type { ModelRegistry } from "../../core/model-registry.ts";
 import { openBrowser } from "../../utils/open-browser.ts";
 import { CODEMODE_TOOL_NAME, isCodemodeTool } from "../codemode/tool.ts";
 import { isToolSearchTool, TOOL_SEARCH_TOOL_NAME } from "../tool-search/tool.ts";
 import {
+	addMcpServerConfig,
 	getMcpToolExposure,
 	type LoadedMcpConfig,
 	loadMcpConfig,
 	type McpExposure,
+	type McpServerConfig,
 	type McpServerConfigPatch,
 	type McpServerEntry,
+	removeMcpServerConfig,
 	updateMcpServerConfig,
 } from "./config.ts";
 import type { McpOAuthCredentialStore, McpSignInPrompt } from "./oauth.ts";
@@ -64,9 +68,48 @@ import type { McpServerConnection, McpServerLog, McpTransportFactory } from "./r
 import { createMcpToolDefinition, createMcpToolName, type McpToolDetails } from "./tools.ts";
 import { type McpMenu, type McpUi, showMcpManager } from "./ui.ts";
 
+export type { McpSignInPrompt } from "./oauth.ts";
 export type { McpTransportFactory } from "./runtime.ts";
 
+/** Safe connection summary exposed to desktop and other host integrations. */
+export interface McpManagerServer {
+	name: string;
+	scope: McpServerEntry["scope"];
+	enabled: boolean;
+	exposure: McpExposure;
+	state: "disabled" | "connecting" | "connected" | "disconnected" | "needs-auth" | "failed" | "closed";
+	toolCount: number;
+	resourceCount: number;
+	usesOAuth: boolean;
+}
+
+export type McpManagerConfigScope = "global" | "project";
+
+/** `reloadRequired` means the saved server list or transport config needs a session reload to take effect. */
+export type McpManagerActionResult =
+	| { ok: true; changed?: boolean; reloadRequired?: boolean }
+	| { ok: false; error: string };
+
+/** Operations over one live MCP extension instance. Config values and OAuth tokens are not returned. */
+export interface McpManagerHandle {
+	getServers(): readonly McpManagerServer[];
+	subscribe(listener: () => void): () => void;
+	signIn(name: string, prompt: McpSignInPrompt): Promise<McpManagerActionResult>;
+	signOut(name: string): Promise<McpManagerActionResult>;
+	reconnect(name: string): Promise<McpManagerActionResult>;
+	setEnabled(name: string, enabled: boolean): Promise<McpManagerActionResult>;
+	setExposure(name: string, exposure: McpExposure): McpManagerActionResult;
+	/** Add a server to the global config or, for trusted projects, the project config. */
+	addServer(name: string, config: McpServerConfig, scope: McpManagerConfigScope): McpManagerActionResult;
+	/** Replace the full config for an existing file-configured server, keeping its current scope. */
+	updateServer(name: string, config: McpServerConfig): McpManagerActionResult;
+	/** Remove an existing file-configured server. */
+	removeServer(name: string): McpManagerActionResult;
+}
+
 export interface McpExtensionOptions {
+	/** Agent directory for this session. Defaults to the process agent directory. */
+	agentDir?: string;
 	/** Defaults to reading `mcp.json` from the agent directory and the trusted project. */
 	loadConfig?: (ctx: ExtensionContext) => LoadedMcpConfig;
 	/** Defaults to stdio and streamable HTTP transports built from the server config. */
@@ -79,6 +122,8 @@ export interface McpExtensionOptions {
 	openUrl?: (url: string) => void;
 	/** Saves `/mcp` changes to the server's config file. Defaults to editing its `mcp.json`. */
 	updateConfig?: (entry: McpServerEntry, patch: McpServerConfigPatch) => void;
+	/** Receives the live manager when a session starts, and `undefined` when it shuts down. */
+	onManager?: (manager: McpManagerHandle | undefined) => void;
 	/**
 	 * How long the first prompt waits for servers with `direct` tools that are still connecting at
 	 * startup, in milliseconds. Their tools become available when they connect. Other servers are
@@ -276,6 +321,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		let overridden: string[] = [];
 		/** Between session_start and session_shutdown. Registrations before that are read on session_start. */
 		let sessionActive = false;
+		let activeContext: ExtensionContext | undefined;
 		let autoEnableCodemode = true;
 		/** Whether the "codemode tools unreachable" warning was shown since the session started. */
 		let warnedUnreachable = false;
@@ -283,6 +329,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		/** Whether a prompt already waited for the startup connections since the session started. */
 		let waitedForStartup = false;
 		const startupWaitMs = options.startupWaitMs ?? DEFAULT_STARTUP_WAIT_MS;
+		const agentDir = options.agentDir ?? getAgentDir();
 		/** Bumped on every session start and shutdown so a runtime load that resolves late is dropped. */
 		let generation = 0;
 		/** Working directory of the session, for stdio servers. */
@@ -330,12 +377,15 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		};
 
 		const getCredentials = (runtime: typeof McpRuntime): McpOAuthCredentialStore => {
-			credentials ??= new runtime.McpOAuthCredentialStore();
+			credentials ??= new runtime.McpOAuthCredentialStore(
+				new FileAuthStorageBackend(join(agentDir, "mcp-auth.json")),
+				agentDir,
+			);
 			return credentials;
 		};
 
 		const getServerLog = (runtime: typeof McpRuntime): McpServerLog => {
-			serverLog ??= new runtime.McpServerLog(options.logPath ?? join(getAgentDir(), "mcp.log"));
+			serverLog ??= new runtime.McpServerLog(options.logPath ?? join(agentDir, "mcp.log"));
 			return serverLog;
 		};
 
@@ -671,6 +721,172 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			return undefined;
 		};
 
+		const manager: McpManagerHandle = {
+			getServers: () =>
+				servers.map((server) => ({
+					name: server.entry.name,
+					scope: server.entry.scope,
+					enabled: isEnabled(server),
+					exposure: exposureOf(server.entry),
+					state: !isEnabled(server) ? "disabled" : (server.connection?.state ?? "connecting"),
+					toolCount: server.connection?.tools.length ?? 0,
+					resourceCount: server.connection?.resources.length ?? 0,
+					usesOAuth:
+						"url" in server.entry.config &&
+						!Object.keys(server.entry.config.headers ?? {}).some(
+							(header) => header.toLowerCase() === "authorization",
+						),
+				})),
+			subscribe,
+			signIn: async (name, prompt) => {
+				const server = findServer(name);
+				if (!server) return { ok: false, error: `No MCP server named "${name}".` };
+				const ctx = activeContext;
+				if (!ctx) return { ok: false, error: "No active MCP session." };
+				try {
+					const error = await signIn(server, prompt);
+					if (error) return { ok: false, error };
+					if (activeContext !== ctx) return { ok: false, error: "MCP session ended during sign-in." };
+					ensureDiscoveryActive(ctx);
+					return { ok: true };
+				} catch (error) {
+					return { ok: false, error: errorMessage(error) };
+				}
+			},
+			signOut: async (name) => {
+				const server = findServer(name);
+				if (!server) return { ok: false, error: `No MCP server named "${name}".` };
+				if (!activeContext) return { ok: false, error: "No active MCP session." };
+				try {
+					return { ok: true, changed: await signOut(server) };
+				} catch (error) {
+					return { ok: false, error: errorMessage(error) };
+				}
+			},
+			reconnect: async (name) => {
+				const server = findServer(name);
+				if (!server) return { ok: false, error: `No MCP server named "${name}".` };
+				const ctx = activeContext;
+				if (!ctx) return { ok: false, error: "No active MCP session." };
+				try {
+					const error = await reconnect(server);
+					if (error) return { ok: false, error };
+					if (activeContext !== ctx) return { ok: false, error: "MCP session ended during reconnect." };
+					ensureDiscoveryActive(ctx);
+					return { ok: true };
+				} catch (error) {
+					return { ok: false, error: errorMessage(error) };
+				}
+			},
+			setEnabled: async (name, enabled) => {
+				const server = findServer(name);
+				if (!server) return { ok: false, error: `No MCP server named "${name}".` };
+				const ctx = activeContext;
+				if (!ctx) return { ok: false, error: "No active MCP session." };
+				try {
+					const error = await setEnabled(server, enabled);
+					if (error) return { ok: false, error };
+					if (activeContext !== ctx) return { ok: false, error: "MCP session ended during update." };
+					ensureDiscoveryActive(ctx);
+					return { ok: true };
+				} catch (error) {
+					return { ok: false, error: errorMessage(error) };
+				}
+			},
+			setExposure: (name, exposure) => {
+				const server = findServer(name);
+				if (!server) return { ok: false, error: `No MCP server named "${name}".` };
+				const ctx = activeContext;
+				if (!ctx) return { ok: false, error: "No active MCP session." };
+				const error = setExposure(server, exposure);
+				if (error) return { ok: false, error };
+				ensureDiscoveryActive(ctx);
+				return { ok: true };
+			},
+			addServer: (name, config, scope) => {
+				const ctx = activeContext;
+				if (!ctx) return { ok: false, error: "No active MCP session." };
+				if (scope === "project" && !ctx.isProjectTrusted()) {
+					return { ok: false, error: "Trust this project before adding a project MCP server." };
+				}
+				const validated = validateMcpServerConfig(name, config);
+				if (typeof validated === "string") return { ok: false, error: validated };
+				if (scope === "project" && "url" in validated && validated.auth) {
+					return { ok: false, error: `MCP server "${name}": auth is only allowed in the global mcp.json` };
+				}
+				const existing = configuredEntries.find((entry) => entry.name === name);
+				if (existing && !(existing.scope === "global" && scope === "project")) {
+					return {
+						ok: false,
+						error: `MCP server "${name}" already exists in the ${existing.scope ?? "current"} scope.`,
+					};
+				}
+				const namespaceConflict = servers.find(
+					(server) => server.entry.name !== name && mcpNamespace(server.entry.name) === mcpNamespace(name),
+				);
+				if (namespaceConflict) {
+					return { ok: false, error: `MCP server "${name}" conflicts with "${namespaceConflict.entry.name}".` };
+				}
+				const path =
+					scope === "global" ? resolve(agentDir, "mcp.json") : resolve(ctx.cwd, CONFIG_DIR_NAME, "mcp.json");
+				try {
+					addMcpServerConfig(path, name, validated);
+				} catch (error) {
+					return { ok: false, error: `Could not update ${path}: ${errorMessage(error)}` };
+				}
+				return { ok: true, changed: true, reloadRequired: true };
+			},
+			updateServer: (name, config) => {
+				const ctx = activeContext;
+				if (!ctx) return { ok: false, error: "No active MCP session." };
+				const server = findServer(name);
+				if (!server) return { ok: false, error: `No MCP server named "${name}".` };
+				if (server.entry.scope === "extension") {
+					return {
+						ok: false,
+						error: `MCP server "${name}" is registered by an extension and cannot be edited here.`,
+					};
+				}
+				if (server.entry.scope === "project" && !ctx.isProjectTrusted()) {
+					return { ok: false, error: "Trust this project before editing its MCP servers." };
+				}
+				const validated = validateMcpServerConfig(name, config);
+				if (typeof validated === "string") return { ok: false, error: validated };
+				if (server.entry.scope === "project" && "url" in validated && validated.auth) {
+					return { ok: false, error: `MCP server "${name}": auth is only allowed in the global mcp.json` };
+				}
+				try {
+					addMcpServerConfig(server.entry.source, name, validated);
+				} catch (error) {
+					return { ok: false, error: `Could not update ${server.entry.source}: ${errorMessage(error)}` };
+				}
+				return { ok: true, changed: true, reloadRequired: true };
+			},
+			removeServer: (name) => {
+				const ctx = activeContext;
+				if (!ctx) return { ok: false, error: "No active MCP session." };
+				const server = findServer(name);
+				if (!server) return { ok: false, error: `No MCP server named "${name}".` };
+				if (server.entry.scope === "extension") {
+					return {
+						ok: false,
+						error: `MCP server "${name}" is registered by an extension and cannot be removed here.`,
+					};
+				}
+				if (server.entry.scope === "project" && !ctx.isProjectTrusted()) {
+					return { ok: false, error: "Trust this project before removing its MCP servers." };
+				}
+				try {
+					if (!removeMcpServerConfig(server.entry.source, name)) {
+						return { ok: false, error: `MCP server "${name}" no longer exists in ${server.entry.source}.` };
+					}
+				} catch (error) {
+					return { ok: false, error: `Could not update ${server.entry.source}: ${errorMessage(error)}` };
+				}
+				return { ok: true, changed: true, reloadRequired: true };
+			},
+		};
+
 		// ---------------------------------------------------------------------------------------
 		// Manager (`/mcp` in the TUI)
 		// ---------------------------------------------------------------------------------------
@@ -690,7 +906,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 					label: server.entry.name,
 					description: `${describeState(server)} · ${exposureOf(server.entry)} · ${server.entry.scope ?? server.entry.source}`,
 				})),
-			empty: `No MCP servers configured. Add them to ${resolve(getAgentDir(), "mcp.json")} or .pi/mcp.json.`,
+			empty: `No MCP servers configured. Add them to ${resolve(agentDir, "mcp.json")} or .pi/mcp.json.`,
 			confirmLabel: "manage",
 			cancelLabel: "close",
 		});
@@ -857,7 +1073,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 
 		const formatStatus = (): string => {
 			if (servers.length === 0 && configErrors.length === 0 && overridden.length === 0) {
-				return `No MCP servers configured. Add them to ${resolve(getAgentDir(), "mcp.json")} or .pi/mcp.json.`;
+				return `No MCP servers configured. Add them to ${resolve(agentDir, "mcp.json")} or .pi/mcp.json.`;
 			}
 			const lines = servers.map((server) => {
 				const { name } = server.entry;
@@ -948,7 +1164,8 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		};
 
 		pi.on("session_start", (_event, ctx) => {
-			const loaded = (options.loadConfig ?? defaultLoadConfig)(ctx);
+			activeContext = ctx;
+			const loaded = options.loadConfig ? options.loadConfig(ctx) : defaultLoadConfig(ctx, agentDir);
 			configErrors = loaded.errors;
 			autoEnableCodemode = loaded.autoEnableCodemode ?? true;
 			warnedUnreachable = false;
@@ -961,6 +1178,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			const registered = registeredServers();
 			overridden = registered.overridden;
 			servers = [...loaded.servers.map((entry) => ({ entry })), ...registered.servers];
+			options.onManager?.(manager);
 			emitChange();
 			// Codemode or tool_search is activated from the config: the first prompt does not wait for
 			// servers whose tools are not declared to the model, and scripts or searches wait for them.
@@ -1083,9 +1301,11 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 
 		pi.on("session_shutdown", async () => {
 			sessionActive = false;
+			activeContext = undefined;
 			generation++;
 			const closing = connections();
 			servers = [];
+			options.onManager?.(undefined);
 			emitChange();
 			await Promise.all(closing.map((connection) => connection.close()));
 		});
@@ -1170,8 +1390,8 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 	};
 }
 
-function defaultLoadConfig(ctx: ExtensionContext): LoadedMcpConfig {
-	return loadMcpConfig({ agentDir: getAgentDir(), cwd: ctx.cwd, projectTrusted: ctx.isProjectTrusted() });
+function defaultLoadConfig(ctx: ExtensionContext, agentDir: string): LoadedMcpConfig {
+	return loadMcpConfig({ agentDir, cwd: ctx.cwd, projectTrusted: ctx.isProjectTrusted() });
 }
 
 export default createMcpExtension();

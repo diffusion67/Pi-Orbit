@@ -567,15 +567,26 @@ export class ExtensionRunner {
 	}
 
 	private wrapUIPromptContext(ui: ExtensionUIContext): ExtensionUIContext {
-		return {
-			...ui,
-			select: (title, options, opts) => this.withUIPrompt("select", title, () => ui.select(title, options, opts)),
-			confirm: (title, message, opts) => this.withUIPrompt("confirm", title, () => ui.confirm(title, message, opts)),
-			input: (title, placeholder, opts) =>
-				this.withUIPrompt("input", title, () => ui.input(title, placeholder, opts)),
-			editor: (title, prefill) => this.withUIPrompt("editor", title, () => ui.editor(title, prefill)),
-			custom: (factory, options) => this.withUIPrompt("custom", undefined, () => ui.custom(factory, options)),
-		};
+		const descriptors: PropertyDescriptorMap = Object.getOwnPropertyDescriptors(ui);
+		const select: ExtensionUIContext["select"] = (title, options, opts) =>
+			this.withUIPrompt("select", title, () => ui.select(title, options, opts));
+		const confirm: ExtensionUIContext["confirm"] = (title, message, opts) =>
+			this.withUIPrompt("confirm", title, () => ui.confirm(title, message, opts));
+		const input: ExtensionUIContext["input"] = (title, placeholder, opts) =>
+			this.withUIPrompt("input", title, () => ui.input(title, placeholder, opts));
+		const editor: ExtensionUIContext["editor"] = (title, prefill) =>
+			this.withUIPrompt("editor", title, () => ui.editor(title, prefill));
+		const custom: ExtensionUIContext["custom"] = (factory, options) =>
+			this.withUIPrompt("custom", undefined, () => ui.custom(factory, options));
+
+		Object.assign(descriptors, {
+			select: { configurable: true, enumerable: true, writable: true, value: select },
+			confirm: { configurable: true, enumerable: true, writable: true, value: confirm },
+			input: { configurable: true, enumerable: true, writable: true, value: input },
+			editor: { configurable: true, enumerable: true, writable: true, value: editor },
+			custom: { configurable: true, enumerable: true, writable: true, value: custom },
+		});
+		return Object.defineProperties({}, descriptors) as ExtensionUIContext;
 	}
 
 	private withUIPrompt<T>(kind: UIPromptKind, title: string | undefined, run: () => Promise<T>): Promise<T> {

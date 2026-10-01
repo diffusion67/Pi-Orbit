@@ -490,6 +490,14 @@ export class AuthStorage implements CredentialStore {
 }
 
 /**
+ * Create the supported file-backed credential store for apps that own auth
+ * flows and need to persist credentials in the standard auth.json format.
+ */
+export function createAuthFileCredentialStore(authPath?: string): CredentialStore {
+	return AuthStorage.create(authPath);
+}
+
+/**
  * One-off synchronous read of a stored credential from an auth.json file,
  * without instantiating a store or resolving configured key values.
  */

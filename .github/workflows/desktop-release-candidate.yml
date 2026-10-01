@@ -1,0 +1,163 @@
+name: Pi Orbit Desktop Unsigned Artifacts
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/desktop-release-candidate.yml"
+      - ".github/workflows/desktop-signed-candidate.yml"
+      - "packages/desktop/**"
+      - "packages/**/src/**"
+      - "packages/**/package.json"
+      - "package.json"
+      - "package-lock.json"
+      - "test/smoke/**"
+  pull_request:
+    paths:
+      - ".github/workflows/desktop-release-candidate.yml"
+      - ".github/workflows/desktop-signed-candidate.yml"
+      - "packages/desktop/**"
+      - "packages/**/src/**"
+      - "packages/**/package.json"
+      - "package.json"
+      - "package-lock.json"
+      - "test/smoke/**"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: desktop-artifacts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-and-installed-smoke:
+    name: ${{ matrix.platform }} desktop artifact
+    runs-on: ${{ matrix.runner }}
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            runner: windows-latest
+            package_script: package:win
+            artifact_glob: packages/desktop/release/*.exe
+          - platform: macos
+            runner: macos-latest
+            package_script: package:mac
+            artifact_glob: packages/desktop/release/*.dmg
+          - platform: linux
+            runner: ubuntu-22.04
+            package_script: package:linux
+            artifact_glob: packages/desktop/release/*.AppImage
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.19.0
+          cache: npm
+
+      - name: Install Linux desktop runtime and build tools
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential libasound2 libfuse2 libgbm1 libgtk-3-0 libnss3 xvfb
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Install Electron runtime and build node-pty
+        shell: bash
+        run: |
+          node node_modules/electron/install.js
+          npm rebuild node-pty --workspace=@earendil-works/pi-orbit
+
+      - name: Build Pi runtime dependencies
+        shell: bash
+        run: |
+          npm run build --workspace=@earendil-works/chord
+          npm run build --workspace=@earendil-works/pi-tui
+          npm run build --workspace=@earendil-works/pi-telemetry
+          npm run build --workspace=@earendil-works/pi-codemode
+          npm run build --workspace=@earendil-works/pi-mcp
+          npm run hydrate-model-data --workspace=@earendil-works/pi-ai
+          npm run build:offline --workspace=@earendil-works/pi-ai
+          npm run build --workspace=@earendil-works/pi-agent-core
+          npm run build --workspace=@earendil-works/pi-durable
+          npm run build:unbundled --workspace=@earendil-works/pi-coding-agent
+
+      - name: Typecheck desktop renderer
+        run: npm run typecheck:renderer --workspace=@earendil-works/pi-orbit
+
+      - name: Test desktop services and worker
+        run: npm run test --workspace=@earendil-works/pi-orbit
+
+      - name: Build desktop application
+        run: npm run build --workspace=@earendil-works/pi-orbit
+
+      - name: Package Windows NSIS installer
+        if: matrix.platform == 'windows'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run ${{ matrix.package_script }} --workspace=@earendil-works/pi-orbit
+
+      - name: Package macOS DMG
+        if: matrix.platform == 'macos'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run ${{ matrix.package_script }} --workspace=@earendil-works/pi-orbit
+
+      - name: Package Linux AppImage
+        if: matrix.platform == 'linux'
+        run: npm run ${{ matrix.package_script }} --workspace=@earendil-works/pi-orbit
+
+      - name: Install, launch, and uninstall packaged app (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: ./test/smoke/windows-installed.ps1
+
+      - name: Mount and launch packaged app from DMG (macOS)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: bash test/smoke/macos-installed.sh
+
+      - name: Launch packaged AppImage (Linux)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: bash test/smoke/linux-installed.sh
+
+      - name: Create SHA-256 manifest (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $artifact = Get-ChildItem packages/desktop/release -Filter *.exe | Where-Object { $_.Name -notlike '*uninstaller*' } | Select-Object -First 1
+          if ($null -eq $artifact) { throw 'NSIS installer was not produced' }
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact.FullName).Hash.ToLowerInvariant()
+          "$hash  $($artifact.Name)" | Set-Content -Encoding ascii packages/desktop/release/SHA256SUMS
+
+      - name: Create SHA-256 manifest (macOS)
+        if: matrix.platform == 'macos'
+        run: cd packages/desktop/release && shasum -a 256 -- *.dmg > SHA256SUMS
+
+      - name: Create SHA-256 manifest (Linux)
+        if: matrix.platform == 'linux'
+        run: cd packages/desktop/release && sha256sum -- *.AppImage > SHA256SUMS
+
+      - name: Upload platform artifact and checksum
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pi-orbit-${{ matrix.platform }}-${{ github.sha }}
+          path: |
+            ${{ matrix.artifact_glob }}
+            packages/desktop/release/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14

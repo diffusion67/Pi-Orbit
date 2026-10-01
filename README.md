@@ -18,6 +18,17 @@ This is the home of the Pi agent harness project including our self extensible c
 * **[@earendil-works/pi-agent-core](packages/agent)**: Agent runtime with tool calling and state management
 * **[@earendil-works/pi-ai](packages/ai)**: Unified multi-provider LLM API (OpenAI, Anthropic, Google, …)
 
+## Pi Orbit Desktop
+
+Pi Orbit is a local desktop host for Pi, built with Electron, React, and
+Vite. It manages local projects and Pi sessions, model credentials, interactive
+terminals, MCP servers, and agent tasks in Git worktrees. Desktop development and
+packaging details are in [packages/desktop/README.md](packages/desktop/README.md).
+
+The desktop revision based on Pi commit `8ce69e9` passed a local unsigned Windows
+installed-app smoke on 2026-10-01. Later syncs, macOS, and Linux installed artifacts still need native CI checks,
+and public distribution requires signing and macOS notarization.
+
 To learn more about Pi:
 
 * [Visit pi.dev](https://pi.dev), the project website with demos
@@ -34,6 +45,7 @@ To learn more about Pi:
 | **[@earendil-works/pi-agent-core](packages/agent)** | Agent runtime with tool calling and state management |
 | **[@earendil-works/pi-coding-agent](packages/coding-agent)** | Interactive coding agent CLI |
 | **[@earendil-works/pi-tui](packages/tui)** | Terminal UI library with differential rendering |
+| **[@earendil-works/pi-orbit](packages/desktop)** | Local Electron desktop host for Pi |
 
 For Slack/chat automation and workflows see [earendil-works/pi-chat](https://github.com/earendil-works/pi-chat).
 

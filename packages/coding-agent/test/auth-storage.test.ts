@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { type CredentialStore, createModels, type Provider } from "@earendil-works/pi-ai";
 import lockfile from "proper-lockfile";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { AuthStorage, FileAuthStorageBackend } from "../src/core/auth-storage.ts";
+import { AuthStorage, createAuthFileCredentialStore, FileAuthStorageBackend } from "../src/core/auth-storage.ts";
 
 describe("AuthStorage", () => {
 	const tempDir = join(tmpdir(), `pi-test-auth-storage-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -35,6 +35,16 @@ describe("AuthStorage", () => {
 			if (original === undefined) delete process.env.TEST_AUTH_STORAGE_KEY;
 			else process.env.TEST_AUTH_STORAGE_KEY = original;
 		}
+	});
+
+	test("creates the supported auth.json credential store for app-owned auth flows", async () => {
+		const storage = createAuthFileCredentialStore(authJsonPath);
+		await storage.modify("anthropic", async () => ({ type: "api_key", key: "app-key" }));
+
+		expect(await storage.list()).toEqual([{ providerId: "anthropic", type: "api_key" }]);
+		expect(await storage.read("anthropic")).toEqual({ type: "api_key", key: "app-key" });
+		await storage.delete("anthropic");
+		expect(await storage.read("anthropic")).toBeUndefined();
 	});
 
 	test("resolves command-backed API-key credentials", async () => {

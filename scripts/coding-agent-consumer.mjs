@@ -14,7 +14,9 @@ function run(command, args, options = {}) {
 	console.log(`$ ${[command, ...args].join(" ")}`);
 	const result = spawnSync(command, args, {
 		encoding: "utf8",
-		shell: process.platform === "win32",
+		// Windows needs a shell for package-manager shims, but shell execution
+		// splits an absolute Node path such as C:\Program Files\nodejs\node.exe.
+		shell: process.platform === "win32" && (command === "npm" || command === "bun"),
 		timeout: 300_000,
 		...options,
 	});

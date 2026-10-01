@@ -587,6 +587,42 @@ describe("ExtensionRunner", () => {
 			expect(ctx.hasUI).toBe(true);
 		});
 
+		it("exposes desktop mode with hasUI true when a desktop UI context is provided", async () => {
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			runner.bindCore(extensionActions, extensionContextActions);
+			runner.setUIContext({} as ExtensionUIContext, "desktop");
+
+			const ctx = runner.createContext();
+			expect(ctx.mode).toBe("desktop");
+			expect(ctx.hasUI).toBe(true);
+		});
+
+		it("does not evaluate UI context getters while installing prompt wrappers", async () => {
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const select = vi.fn(async () => "chosen");
+			let themeReads = 0;
+			const ui = {
+				select,
+				get theme() {
+					themeReads++;
+					throw new Error("terminal-only theme was read");
+				},
+			} as unknown as ExtensionUIContext;
+
+			runner.setUIContext(ui, "desktop");
+
+			const wrappedUI = runner.createContext().ui;
+			expect(themeReads).toBe(0);
+			expect(Object.getOwnPropertyDescriptor(wrappedUI, "theme")?.get).toBe(
+				Object.getOwnPropertyDescriptor(ui, "theme")?.get,
+			);
+			await expect(wrappedUI.select("Pick", ["chosen"])).resolves.toBe("chosen");
+			expect(select).toHaveBeenCalledWith("Pick", ["chosen"], undefined);
+			expect(themeReads).toBe(0);
+		});
+
 		it("exposes tui mode with hasUI true when a TUI UI context is provided", async () => {
 			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
 			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);

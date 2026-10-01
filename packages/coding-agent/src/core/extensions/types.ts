@@ -320,14 +320,14 @@ export interface CompactOptions {
 /**
  * Context passed to extension event handlers.
  */
-export type ExtensionMode = "tui" | "rpc" | "json" | "print";
+export type ExtensionMode = "tui" | "rpc" | "desktop" | "json" | "print";
 
 export interface ExtensionContext {
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
 	/** Current run mode. Use "tui" to guard terminal-only UI such as custom components. */
 	mode: ExtensionMode;
-	/** Whether dialog-capable UI is available (true in TUI and RPC modes) */
+	/** Whether dialog-capable UI is available (true when a TUI, RPC, or desktop UI context is provided). */
 	hasUI: boolean;
 	/** Current working directory */
 	cwd: string;
