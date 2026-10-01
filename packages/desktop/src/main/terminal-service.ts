@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { access, realpath, stat } from "node:fs/promises";
-import { basename, isAbsolute, join } from "node:path";
+import { basename, isAbsolute, win32 } from "node:path";
 import type { IPtyForkOptions, IWindowsPtyForkOptions } from "node-pty";
 import * as nodePty from "node-pty";
 
@@ -190,7 +190,7 @@ export class TerminalService {
 	}> {
 		if (this.platform === "win32") {
 			const windowsRoot = this.environment.SystemRoot || "C:\\Windows";
-			const file = join(windowsRoot, "System32", "cmd.exe");
+			const file = win32.join(windowsRoot, "System32", "cmd.exe");
 			return { file, interactiveArgs: ["/Q"], commandArgs: (command) => ["/Q", "/C", command] };
 		}
 

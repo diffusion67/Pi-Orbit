@@ -128,8 +128,8 @@ async function repository(): Promise<{
 	return { root, projectPath, agentDirectory, dataDirectory };
 }
 
-async function settled<T>(load: () => Promise<T>, check: (value: T) => boolean): Promise<T> {
-	for (let attempt = 0; attempt < 100; attempt++) {
+async function settled<T>(load: () => Promise<T>, check: (value: T) => boolean, attempts = 100): Promise<T> {
+	for (let attempt = 0; attempt < attempts; attempt++) {
 		const result = await load();
 		if (check(result)) return result;
 		await new Promise((resolve) => setTimeout(resolve, 10));
@@ -955,6 +955,7 @@ describe("desktop app service", () => {
 			const snapshot = await settled(
 				() => service.snapshot(),
 				(value) => children.every((id) => value.tasks.find((task) => task.id === id)?.status !== "queued"),
+				1_000, // This scenario must outlast the worker manager's 5-second forced-exit timeout.
 			);
 			assert.equal(
 				children.filter((id) => snapshot.tasks.find((task) => task.id === id)?.status === "running").length,
@@ -964,8 +965,9 @@ describe("desktop app service", () => {
 				children.filter((id) => snapshot.tasks.find((task) => task.id === id)?.status === "failed").length,
 				1,
 			);
-			workers[1]?.exit(0);
 		} finally {
+			// Release deliberately unresponsive fakes even when an assertion fails.
+			for (const worker of workers) if (worker.ignoreKill) worker.exit(0);
 			await service.close();
 		}
 	});
