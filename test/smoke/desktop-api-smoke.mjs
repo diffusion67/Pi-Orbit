@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { CdpConnectionClosedError, closeApp } from "./desktop-shutdown.mjs";
 
 async function main() {
 const executable = process.argv[2];
@@ -332,24 +333,6 @@ async function waitFor(predicate, label) {
 	throw new Error(`Timed out waiting for ${label}`);
 }
 
-async function closeApp(connection, child) {
-	assertOk(await invoke(connection, "app.quit"), "request graceful application shutdown");
-	await connection.close().catch(() => undefined);
-	const stopAt = Date.now() + 12_000;
-	while (Date.now() < stopAt && child.exitCode === null) await delay(100);
-	if (child.exitCode === null) {
-		let processExists = true;
-		try {
-			process.kill(child.pid, 0);
-		} catch {
-			processExists = false;
-		}
-		console.error(JSON.stringify({ pid: child.pid, exitCode: child.exitCode, signalCode: child.signalCode, killed: child.killed, processExists }));
-		child.kill();
-		throw new Error("Installed application did not exit after app.quit");
-	}
-}
-
 async function getUnusedPort() {
 	const probe = createServer();
 	probe.listen(0, "127.0.0.1");
@@ -378,7 +361,7 @@ class CdpConnection {
 			else pending.resolve(message.result);
 		});
 		socket.addEventListener("close", () => {
-			for (const pending of this.pending.values()) pending.reject(new Error("CDP connection closed"));
+			for (const pending of this.pending.values()) pending.reject(new CdpConnectionClosedError());
 			this.pending.clear();
 		});
 	}
