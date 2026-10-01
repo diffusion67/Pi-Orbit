@@ -180,6 +180,7 @@ try {
 	await waitFor(async () => (await cdp.evaluate("document.documentElement.lang")) === "zh-CN", "Chinese desktop language");
 	const session = assertOk(await invoke(cdp, "session.create", { projectId: project.id, model: "orbit-smoke/smoke" }), "create faux-model session");
 	console.log("Installed smoke: session created");
+	await waitFor(async () => (await cdp.evaluate("document.querySelector('.rename-session-button')?.disabled === false")) === true, "active session rename action");
 	await cdp.evaluate("document.querySelector('.rename-session-button').click()");
 	await waitFor(async () => (await cdp.evaluate("Boolean(document.querySelector('.session-rename input'))")) === true, "session rename form");
 	const longTitle = "Long session title ".repeat(12).slice(0, 200);
@@ -188,6 +189,7 @@ try {
 	await waitFor(async () => (await cdp.evaluate("document.querySelector('.conversation-head h1')?.textContent")) === longTitle, "long session title");
 	const titleFits = await cdp.evaluate("document.querySelector('.conversation-head h1').getBoundingClientRect().right <= document.querySelector('.conversation-actions').getBoundingClientRect().left");
 	if (!titleFits) throw new Error("A long session title overlaps conversation actions");
+	await waitFor(async () => (await cdp.evaluate("Boolean(document.querySelector('.session-rename'))")) === false, "completed session rename");
 	await cdp.evaluate("document.querySelector('.rename-session-button').click()");
 	await waitFor(async () => (await cdp.evaluate("Boolean(document.querySelector('.session-rename input'))")) === true, "reopened session rename form");
 	await setFieldValue(cdp, ".session-rename input", "Orbit smoke renamed session");

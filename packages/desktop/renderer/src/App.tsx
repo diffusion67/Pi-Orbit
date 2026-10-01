@@ -101,7 +101,7 @@ function App() {
 	const activeTask = projectTasks.find((task) => task.id === selectedTaskId) ?? projectTasks.find((task) => task.status !== "merged");
 	const catalogItems = snapshot.catalog[catalogKind];
 	useEffect(() => { setSessionSearch(""); }, [snapshot.activeProjectId]);
-	useEffect(() => { setRenameTarget(null); composingRef.current = false; }, [snapshot.activeSessionId]);
+	useEffect(() => { setRenameTarget((current) => current && current.sessionId !== snapshot.activeSessionId ? null : current); composingRef.current = false; }, [snapshot.activeSessionId]);
 
 	useEffect(() => {
 		setLanguagePreview(snapshot.settings.language);
