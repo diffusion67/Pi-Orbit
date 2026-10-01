@@ -143,6 +143,105 @@ afterEach(async () => {
 });
 
 describe("desktop app service", () => {
+	it("validates session names and restores renames after restart", async () => {
+		const paths = await repository();
+		const options = {
+			dataDirectory: paths.dataDirectory,
+			agentDirectory: paths.agentDirectory,
+			createWorkerTransport: () => new FakeWorker(),
+		};
+		let service = await DesktopAppService.open(options);
+		try {
+			const opened = await service.invoke("project.open", { path: paths.projectPath });
+			assert.equal(opened.ok, true);
+			if (!opened.ok) return;
+			const created = await service.invoke("session.create", { projectId: (opened.data as { id: string }).id });
+			assert.equal(created.ok, true);
+			if (!created.ok) return;
+			const sessionId = (created.data as { id: string }).id;
+			for (const title of ["", "   ", "x".repeat(201), "bad\nname", "bad\u0000name"]) {
+				const result = await service.invoke("session.rename", { sessionId, title });
+				assert.equal(result.ok, false);
+				if (!result.ok) assert.equal(result.code, "INVALID_ARGUMENT");
+			}
+			assert.equal((await service.invoke("session.rename", { sessionId, title: "  发布计划  " })).ok, true);
+			await service.close();
+			service = await DesktopAppService.open(options);
+			assert.equal(
+				(await service.snapshot()).sessions.find((session) => session.id === sessionId)?.title,
+				"发布计划",
+			);
+			const missing = await service.invoke("session.rename", { sessionId: "missing", title: "valid" });
+			assert.equal(missing.ok, false);
+			if (!missing.ok) assert.equal(missing.code, "SESSION_NOT_FOUND");
+		} finally {
+			await service.close();
+		}
+	});
+
+	it("does not replace the active transcript when an earlier session selection finishes late", async () => {
+		const paths = await repository();
+		const workers: FakeWorker[] = [];
+		const service = await DesktopAppService.open({
+			dataDirectory: paths.dataDirectory,
+			agentDirectory: paths.agentDirectory,
+			createWorkerTransport: () => {
+				const worker = new FakeWorker();
+				workers.push(worker);
+				return worker;
+			},
+		});
+		try {
+			const opened = await service.invoke("project.open", { path: paths.projectPath });
+			assert.equal(opened.ok, true);
+			if (!opened.ok) return;
+			const projectId = (opened.data as { id: string }).id;
+			const first = await service.invoke("session.create", { projectId });
+			assert.equal(first.ok, true);
+			if (!first.ok) return;
+			const firstId = (first.data as { id: string }).id;
+			assert.equal((await service.invoke("session.select", { sessionId: firstId })).ok, true);
+			const firstWorker = workers.at(-1)!;
+			firstWorker.historyMessages = [{ type: "message", entryId: "first", role: "user", text: "first session" }];
+			const second = await service.invoke("session.create", { projectId });
+			assert.equal(second.ok, true);
+			if (!second.ok) return;
+			const secondId = (second.data as { id: string }).id;
+			assert.equal((await service.invoke("session.select", { sessionId: secondId })).ok, true);
+			workers.at(-1)!.historyMessages = [
+				{ type: "message", entryId: "second", role: "user", text: "second session" },
+			];
+			let releaseHistory: (() => void) | undefined;
+			const postMessage = firstWorker.postMessage.bind(firstWorker);
+			firstWorker.postMessage = (request) => {
+				if (request && typeof request === "object" && "type" in request && request.type === "history")
+					releaseHistory = () => postMessage(request);
+				else postMessage(request);
+			};
+			const slowSelection = service.invoke("session.select", { sessionId: firstId });
+			await settled(
+				async () => releaseHistory,
+				(release) => release !== undefined,
+			);
+			assert.equal((await service.invoke("session.select", { sessionId: secondId })).ok, true);
+			releaseHistory!();
+			assert.equal((await slowSelection).ok, true);
+			const snapshot = await service.snapshot();
+			assert.equal(snapshot.activeSessionId, secondId);
+			assert.deepEqual(
+				snapshot.messages.map((message) => message.id),
+				["second"],
+			);
+			assert.equal((await service.invoke("project.open", { path: paths.projectPath })).ok, true);
+			assert.deepEqual(
+				(await service.snapshot()).messages.map((message) => message.id),
+				["second"],
+			);
+		} finally {
+			await service.close();
+		}
+	});
+
 	it("validates named commands and reconnects from a durable event sequence", async () => {
 		const paths = await repository();
 		const service = await DesktopAppService.open({

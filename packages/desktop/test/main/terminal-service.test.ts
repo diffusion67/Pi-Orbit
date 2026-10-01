@@ -1,4 +1,4 @@
-import { mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -47,6 +47,28 @@ class FakePty {
 }
 
 describe("TerminalService", () => {
+	it.skipIf(process.platform === "win32")("starts a POSIX sh alias whose executable is dash", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "pi-orbit-dash-"));
+		const executable = join(cwd, "dash");
+		const shell = join(cwd, "sh");
+		const spawn = vi.fn(() => new FakePty());
+		const service = new TerminalService({
+			spawn,
+			onOutput: () => undefined,
+			platform: "linux",
+			environment: { SHELL: shell },
+		});
+		try {
+			await writeFile(executable, "#!/bin/sh\n", { mode: 0o755 });
+			await symlink(executable, shell);
+			await service.start(cwd);
+			expect(spawn).toHaveBeenCalledWith(await realpath(executable), ["-i"], expect.any(Object));
+		} finally {
+			service.closeAll();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	it("uses the canonical project directory when started through a directory alias", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "pi-orbit-terminal-"));
 		const alias = `${directory}-alias`;

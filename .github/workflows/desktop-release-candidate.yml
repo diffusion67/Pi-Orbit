@@ -161,3 +161,11 @@ jobs:
             packages/desktop/release/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
+
+      - name: Upload desktop smoke screenshot
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pi-orbit-ui-${{ matrix.platform }}-${{ github.sha }}
+          path: packages/desktop/release/ui-smoke.png
+          if-no-files-found: error
+          retention-days: 14

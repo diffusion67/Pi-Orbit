@@ -110,7 +110,13 @@ export type DesktopSnapshot = {
 		sendShortcut: "enter" | "ctrlEnter";
 	};
 	features: { terminal: boolean; desktopExtensions: boolean };
-	terminal?: { id: string; title: string; state: "starting" | "running" | "exited"; output: string };
+	terminal?: {
+		id: string;
+		title: string;
+		state: "starting" | "running" | "exited";
+		output: string;
+		outputOffset?: number;
+	};
 	capabilities: Record<string, { available: boolean; diagnostic?: string }>;
 };
 export type DesktopEvent =

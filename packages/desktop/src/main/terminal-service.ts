@@ -197,7 +197,11 @@ export class TerminalService {
 		const userShell = this.environment.SHELL;
 		const userShellName = userShell && isAbsolute(userShell) ? basename(userShell) : "";
 		const candidates =
-			userShellName === "bash" || userShellName === "zsh" || userShellName === "sh" || userShellName === "fish"
+			userShellName === "bash" ||
+			userShellName === "zsh" ||
+			userShellName === "sh" ||
+			userShellName === "dash" ||
+			userShellName === "fish"
 				? [userShell]
 				: this.platform === "darwin"
 					? ["/bin/zsh", "/bin/bash", "/bin/sh"]
@@ -208,7 +212,7 @@ export class TerminalService {
 				const canonical = await realpath(file);
 				await access(canonical, constants.X_OK);
 				const name = basename(canonical);
-				if (name !== "bash" && name !== "zsh" && name !== "sh" && name !== "fish") continue;
+				if (name !== "bash" && name !== "zsh" && name !== "sh" && name !== "dash" && name !== "fish") continue;
 				return { file: canonical, interactiveArgs: ["-i"], commandArgs: (command) => ["-ic", command] };
 			} catch {
 				// Try the next known system shell.

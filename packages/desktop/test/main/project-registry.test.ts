@@ -6,6 +6,36 @@ import { describe, expect, it } from "vitest";
 import { ProjectRegistry } from "../../src/main/project-registry.ts";
 
 describe("ProjectRegistry", () => {
+	it("persists a renamed session and protects its title from stale worker updates", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "pi-orbit-session-name-"));
+		const database = join(directory, "app.sqlite");
+		let db = await openNodeSqliteDatabase(database);
+		try {
+			let registry = await ProjectRegistry.open(db);
+			const project = await registry.openProject(directory);
+			const stale = {
+				id: "session",
+				projectId: project.id,
+				file: join(directory, "session.jsonl"),
+				title: "New session",
+				updatedAt: new Date().toISOString(),
+				model: "",
+				status: "idle" as const,
+			};
+			await registry.upsertSession(stale);
+			await registry.renameSession("session", "Release notes");
+			await registry.upsertSession({ ...stale, status: "running" });
+			expect((await registry.getSession("session"))?.title).toBe("Release notes");
+			await db.close();
+			db = await openNodeSqliteDatabase(database);
+			registry = await ProjectRegistry.open(db);
+			expect((await registry.listSessions(project.id))[0]?.title).toBe("Release notes");
+		} finally {
+			await db.close();
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
 	it("opens a project once and restores session selection without auto-running it", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "pi-orbit-project-"));
 		const database = join(directory, "app.sqlite");

@@ -28,6 +28,21 @@ function task(id: string, projectId = "project", dependsOn: readonly string[] = 
 }
 
 describe("TeamTaskStore", () => {
+	it("atomically limits simultaneous resumes to four running tasks", async () => {
+		const { store } = await openStore();
+		for (let index = 0; index < 5; index++) await store.createTask(task(`parallel-${index}`));
+		await store.startReadyTasks("project");
+		await store.transitionTask("parallel-0", "paused");
+		await store.startReadyTasks("project");
+		await store.transitionTask("parallel-1", "paused");
+		const outcomes = await Promise.allSettled([
+			store.transitionTask("parallel-0", "running"),
+			store.transitionTask("parallel-1", "running"),
+		]);
+		expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+		expect((await store.snapshot("project")).tasks.filter((item) => item.status === "running")).toHaveLength(4);
+	});
+
 	it("persists task state and a matching, increasing event sequence", async () => {
 		const { store } = await openStore();
 		const created = await store.createTask(task("first"));

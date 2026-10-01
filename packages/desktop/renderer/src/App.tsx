@@ -6,6 +6,8 @@ import type { AppSnapshot, AuthFlowEvent, CatalogEntry, Command, CommandMap, Des
 import { createTranslator, type Language, type Translate } from "./i18n";
 import { AttachmentBudget, MAX_ATTACHMENT_BYTES } from "../../src/shared/attachments.ts";
 import { McpPanel } from "./McpPanel";
+import { SessionComposer, filterProjectSessions, shouldSendKey } from "../../src/shared/session-composer.ts";
+import { appendTerminalOutput, terminalOutputDelta } from "../../src/shared/terminal-output.ts";
 
 type CatalogKind = "skills" | "templates" | "commands" | "extensions";
 type Modal = "settings" | "roles" | "catalog" | "mcp" | "new-task" | "open-project" | "terminal" | null;
@@ -62,8 +64,15 @@ function App() {
 	const [catalogKind, setCatalogKind] = useState<CatalogKind>("skills");
 	const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
 	const [selectedFile, setSelectedFile] = useState<string | null>(null);
-	const [draft, setDraft] = useState("");
-	const [attachments, setAttachments] = useState<DesktopAttachment[]>([]);
+	const [composer] = useState(() => new SessionComposer({
+		getItem: (key) => window.localStorage.getItem(key),
+		setItem: (key, value) => window.localStorage.setItem(key, value),
+		removeItem: (key) => window.localStorage.removeItem(key),
+	}));
+	const [, renderComposer] = useState(0);
+	const [sessionSearch, setSessionSearch] = useState("");
+	const [renameTarget, setRenameTarget] = useState<{ sessionId: string; title: string } | null>(null);
+	const [renaming, setRenaming] = useState(false);
 	const [sessionDelivery, setSessionDelivery] = useState<"steer" | "followUp">("steer");
 	const [projectPath, setProjectPath] = useState("");
 	const [eventRequest, setEventRequest] = useState<Extract<DesktopEvent, { type: "extension.request" }> | null>(null);
@@ -71,17 +80,28 @@ function App() {
 	const [mcpAuthEvent, setMcpAuthEvent] = useState<McpAuthEvent>();
 	const transcriptRef = useRef<HTMLDivElement>(null);
 	const attachmentInputRef = useRef<HTMLInputElement>(null);
-	const attachmentsRef = useRef<DesktopAttachment[]>([]);
+	const composingRef = useRef(false);
 	const attachmentBudgetRef = useRef(new AttachmentBudget());
 	const syncedExtensionEditors = useRef(new Map<string, string>());
 	const dismissedAuthFlows = useRef(new Set<string>());
 	const lastEventSeq = useRef(0);
 	const activeProject = snapshot.projects.find((project) => project.id === snapshot.activeProjectId);
 	const activeSession = snapshot.sessions.find((session) => session.id === snapshot.activeSessionId);
+	const { text: draft, attachments, sending } = activeSession ? composer.get(activeSession.id) : { text: "", attachments: [], sending: false };
+	const visibleSessions = filterProjectSessions(snapshot.sessions, activeProject?.id, sessionSearch);
+	const setDraft = (value: string | ((current: string) => string)) => {
+		if (!activeSession) return;
+		try {
+			composer.setText(activeSession.id, typeof value === "function" ? value(composer.get(activeSession.id).text) : value);
+			renderComposer((version) => version + 1);
+		} catch (cause) { setError(cause instanceof Error ? cause.message : "Could not update draft."); }
+	};
 	const sessionExtensionUi = activeSession ? snapshot.extensionUi[`session:${activeSession.id}`] : undefined;
 	const projectTasks = snapshot.tasks.filter((task) => task.projectId === snapshot.activeProjectId);
 	const activeTask = projectTasks.find((task) => task.id === selectedTaskId) ?? projectTasks.find((task) => task.status !== "merged");
 	const catalogItems = snapshot.catalog[catalogKind];
+	useEffect(() => { setSessionSearch(""); }, [snapshot.activeProjectId]);
+	useEffect(() => { setRenameTarget((current) => current && current.sessionId !== snapshot.activeSessionId ? null : current); composingRef.current = false; }, [snapshot.activeSessionId]);
 
 	useEffect(() => {
 		setLanguagePreview(snapshot.settings.language);
@@ -104,7 +124,7 @@ function App() {
 			if (event.type === "task") return { ...current, lastEventSeq: event.seq, tasks: current.tasks.some((item) => item.id === event.task.id) ? current.tasks.map((item) => item.id === event.task.id ? event.task : item) : [...current.tasks, event.task] };
 			if (event.type === "extension.update") return { ...current, lastEventSeq: event.seq, extensionUi: { ...current.extensionUi, [event.workerKey]: event.state } };
 			if (event.type === "mcp.status") return { ...current, lastEventSeq: event.seq, ...(event.workerKey === `session:${current.activeSessionId}` ? { mcpServers: event.servers } : {}) };
-			if (event.type === "terminal.output" && current.terminal?.id === event.terminalId) return { ...current, lastEventSeq: event.seq, terminal: { ...current.terminal, output: `${current.terminal.output}${event.text}` } };
+			if (event.type === "terminal.output" && current.terminal?.id === event.terminalId) return { ...current, lastEventSeq: event.seq, terminal: { ...current.terminal, ...appendTerminalOutput(current.terminal, event.text) } };
 			return { ...current, lastEventSeq: event.seq };
 		});
 	}, []);
@@ -189,6 +209,19 @@ function App() {
 		const result = await call("app.snapshot", undefined);
 		if (result.ok) setSnapshot(result.data);
 	};
+	const renameSession = async (event: FormEvent<HTMLFormElement>) => {
+		event.preventDefault();
+		if (!renameTarget || renaming || !renameTarget.title.trim()) return;
+		const target = renameTarget;
+		setRenaming(true);
+		try {
+			const result = await call("session.rename", { sessionId: target.sessionId, title: target.title.trim() });
+			if (result.ok) {
+				setRenameTarget((current) => current === target ? null : current);
+				await refreshSnapshot();
+			}
+		} finally { setRenaming(false); }
+	};
 	const openProject = async (path: string) => {
 		const result = await call("project.open", { path });
 		if (result.ok) await refreshSnapshot();
@@ -204,16 +237,17 @@ function App() {
 		if (!result.data.merged) setError(result.data.conflicts.length ? `Merge needs attention: ${result.data.conflicts.join(", ")}` : "Merge was not applied. Review the task diff and try again.");
 	};
 	const addAttachments = async (event: ChangeEvent<HTMLInputElement>) => {
+		const sessionId = activeSession?.id;
 		const files = Array.from(event.target.files ?? []);
 		event.target.value = "";
-		if (files.length === 0) return;
+		if (!sessionId || files.length === 0) return;
 		let releaseBudget: (() => void) | undefined;
 		try {
 			const emptyFile = files.find((file) => file.size === 0);
 			if (emptyFile) throw new Error(`${emptyFile.name} is empty.`);
 			const oversizedFile = files.find((file) => file.size > MAX_ATTACHMENT_BYTES);
 			if (oversizedFile) throw new Error(`${oversizedFile.name} exceeds the 8 MiB attachment limit.`);
-			releaseBudget = attachmentBudgetRef.current.reserve(files, attachmentsRef.current);
+			releaseBudget = attachmentBudgetRef.current.reserve(files, composer.get(sessionId).attachments);
 			const loaded: DesktopAttachment[] = [];
 			for (const file of files) {
 				const extension = /\.[^.]+$/.exec(file.name)?.[0]?.toLowerCase() ?? "";
@@ -233,9 +267,8 @@ function App() {
 					throw new Error(`${file.name} is not a supported image or text file.`);
 				}
 			}
-			const nextAttachments = [...attachmentsRef.current, ...loaded];
-			attachmentsRef.current = nextAttachments;
-			setAttachments(nextAttachments);
+			composer.addAttachments(sessionId, loaded);
+			renderComposer((version) => version + 1);
 			setError(null);
 		} catch (cause) {
 			setError(cause instanceof Error ? cause.message : "Could not read the selected file.");
@@ -243,25 +276,25 @@ function App() {
 			releaseBudget?.();
 		}
 	};
-	const promptSession = async (text: string) => {
-		if (!activeSession || (!text.trim() && attachments.length === 0)) return;
-		const payloadAttachments = attachments.length ? attachments : undefined;
+	const promptSession = async () => {
+		if (!activeSession) return;
+		const pending = composer.beginSend(activeSession.id);
+		if (!pending) return;
+		renderComposer((version) => version + 1);
+		const payloadAttachments = pending.attachments.length ? [...pending.attachments] : undefined;
 		const result = activeSession.status === "running"
-			? await call("session.message", { sessionId: activeSession.id, text: text.trim(), deliverAs: sessionDelivery, ...(payloadAttachments ? { attachments: payloadAttachments } : {}) })
-			: await call("session.prompt", { sessionId: activeSession.id, text: text.trim(), ...(payloadAttachments ? { attachments: payloadAttachments } : {}) });
-		if (result.ok) {
-			setDraft("");
-			attachmentsRef.current = [];
-			setAttachments([]);
-		}
+			? await call("session.message", { sessionId: pending.sessionId, text: pending.text.trim(), deliverAs: sessionDelivery, ...(payloadAttachments ? { attachments: payloadAttachments } : {}) })
+			: await call("session.prompt", { sessionId: pending.sessionId, text: pending.text.trim(), ...(payloadAttachments ? { attachments: payloadAttachments } : {}) });
+		composer.finishSend(pending, result.ok);
+		renderComposer((version) => version + 1);
 	};
 	const removeAttachment = (index: number) => {
-		const nextAttachments = attachmentsRef.current.filter((_, itemIndex) => itemIndex !== index);
-		attachmentsRef.current = nextAttachments;
-		setAttachments(nextAttachments);
+		if (!activeSession) return;
+		composer.removeAttachment(activeSession.id, index);
+		renderComposer((version) => version + 1);
 	};
 	const openCatalog = (kind: CatalogKind) => { setCatalogKind(kind); setModal("catalog"); };
-	const submitPrompt = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); void promptSession(draft); };
+	const submitPrompt = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); void promptSession(); };
 
 	return <main className="app-shell">
 		<header className="topbar">
@@ -294,8 +327,9 @@ function App() {
 					{snapshot.projects.length === 0 && <form className="inline-open" onSubmit={(event) => { event.preventDefault(); if (projectPath.trim()) void openProject(projectPath.trim()); }}><label htmlFor="project-path">{t("Folder path")}</label><div><input id="project-path" value={projectPath} onChange={(event) => setProjectPath(event.target.value)} placeholder="C:\\work\\project" /><button type="submit" aria-label={t("Open folder")}>↵</button></div></form>}
 					{activeProject && <>
 						<div className="section-head session-heading"><span>{t("Sessions")}</span><button className="tiny-icon" aria-label={t("New session")} onClick={() => void createSession(activeProject.id)}>＋</button></div>
-						{snapshot.sessions.filter((session) => session.projectId === activeProject.id).map((session) => <button key={session.id} className={`session-row ${session.id === activeSession?.id ? "selected" : ""}`} onClick={() => void selectSession(session.id)}><span className="session-glyph">◷</span><span className="row-text">{session.title || t("Untitled session")}</span>{session.status === "running" && <span className="live-dot" />}</button>)}
-						{snapshot.sessions.filter((session) => session.projectId === activeProject.id).length === 0 && <p className="empty-hint">{t("No sessions yet. Create one with ＋.")}</p>}
+						<input className="session-search" type="search" aria-label={t("Search sessions")} placeholder={t("Search sessions…")} value={sessionSearch} onChange={(event) => setSessionSearch(event.target.value)} />
+						{visibleSessions.map((session) => <button key={session.id} className={`session-row ${session.id === activeSession?.id ? "selected" : ""}`} onClick={() => void selectSession(session.id)}><span className="session-glyph">◷</span><span className="row-text">{session.title || t("Untitled session")}</span>{session.status === "running" && <span className="live-dot" />}</button>)}
+						{visibleSessions.length === 0 && <p className="empty-hint">{t(sessionSearch.trim() ? "No matching sessions." : "No sessions yet. Create one with ＋.")}</p>}
 					</>}
 					<div className="section-head tools-heading"><span>{t("Library")}</span></div>
 					<button className="nav-row" onClick={() => openCatalog("skills")}><span>✳</span><span>{t("Skills")}</span><small>{snapshot.catalog.skills.length}</small></button>
@@ -308,7 +342,8 @@ function App() {
 			</aside>
 
 			<section className="conversation" aria-label={t("Conversation")}>
-			<div className="conversation-head"><div><div className="crumb">{activeProject?.name ?? t("No project selected")}<span>/</span>{activeSession?.title ?? t("New conversation")}</div><h1>{activeSession?.title || t("Pi workspace")}</h1></div><div className="conversation-actions"><span className={`status-pill ${activeSession?.status === "running" ? "is-running" : ""}`}><i />{activeSession?.status === "running" ? t("Running") : t("Ready")}</span><button className="action-button" disabled={!activeSession} onClick={() => activeSession && void call("session.fork", { sessionId: activeSession.id })}>⑂ {t("Fork")}</button><button className="action-button" disabled={!activeSession} onClick={() => activeSession && void call("session.compact", { sessionId: activeSession.id })}>↘ {t("Compact")}</button><button className="action-button primary-action" disabled={!activeProject} onClick={() => setModal("new-task")}>＋ {t("New task")}</button></div></div>
+			<div className="conversation-head"><div><div className="crumb">{activeProject?.name ?? t("No project selected")}<span>/</span>{activeSession?.title ?? t("New conversation")}</div><h1>{activeSession?.title || t("Pi workspace")}</h1></div><div className="conversation-actions"><button className="action-button rename-session-button" aria-label={t("Rename session")} disabled={!activeSession} onClick={() => activeSession && setRenameTarget({ sessionId: activeSession.id, title: activeSession.title })}>{t("Rename")}</button><span className={`status-pill ${activeSession?.status === "running" ? "is-running" : ""}`}><i />{activeSession?.status === "running" ? t("Running") : t("Ready")}</span><button className="action-button" disabled={!activeSession} onClick={() => activeSession && void call("session.fork", { sessionId: activeSession.id })}>⑂ {t("Fork")}</button><button className="action-button" disabled={!activeSession} onClick={() => activeSession && void call("session.compact", { sessionId: activeSession.id })}>↘ {t("Compact")}</button><button className="action-button primary-action" disabled={!activeProject} onClick={() => setModal("new-task")}>＋ {t("New task")}</button></div></div>
+			{renameTarget && <form className="session-rename" onSubmit={(event) => void renameSession(event)}><label>{t("Session name")}<input autoFocus maxLength={200} required value={renameTarget.title} onChange={(event) => setRenameTarget({ ...renameTarget, title: event.target.value })} onKeyDown={(event) => { if (event.key === "Escape") setRenameTarget(null); }} /></label><button type="submit" className="primary-action" disabled={renaming || !renameTarget.title.trim()}>{t("Save name")}</button><button type="button" className="outline-button" onClick={() => setRenameTarget(null)}>{t("Cancel")}</button></form>}
 			{activeSession && <div className="model-line"><span className="model-glyph">◈</span><select aria-label={t("Model")} value={activeSession.model || snapshot.settings.defaultModel} onChange={(event) => void call("model.select", { sessionId: activeSession.id, model: event.target.value })}><option value="">{t("Choose model")}</option>{snapshot.providers.flatMap((provider) => provider.models.map((model) => <option key={`${provider.id}:${model}`} value={model}>{model}</option>))}</select><span className="model-provider">{snapshot.providers.find((provider) => provider.models.includes(activeSession.model))?.name ?? (snapshot.providers.length ? t("Choose a model") : t("Configure a provider in Settings"))}</span>{snapshot.providers.length === 0 && <button type="button" className="text-button" onClick={() => setModal("settings")}>{t("Settings")}</button>}</div>}
 				<div className="transcript" ref={transcriptRef} aria-live="polite" aria-relevant="additions text">
 					{!activeSession ? (
@@ -333,7 +368,7 @@ function App() {
 				{activeSession && <ExtensionUiPanel state={sessionExtensionUi} t={t} onUseEditorText={(text) => setDraft(text)} />}
 				<div className="composer-wrap">
 					{activeSession && snapshot.catalog.skills.filter((skill) => skill.enabled).slice(0, 3).map((skill) => <button className="context-chip" key={skill.id} onClick={() => void call("catalog.run", { kind: "skill", id: skill.id }).then((result) => { if (result.ok && result.data.insertedText) setDraft((current) => `${current}${current ? "\n\n" : ""}${result.data.insertedText}`); })}>✳ {skill.name}</button>)}
-					<form className="composer" onSubmit={submitPrompt}><input ref={attachmentInputRef} className="attachment-file-input" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,text/*,.md,.markdown,.json,.jsonc,.yaml,.yml,.toml,.csv,.tsv,.log,.js,.jsx,.ts,.tsx,.css,.html,.xml,.py,.rs,.go,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sh,.sql,.env,.diff,.patch,.ini,.conf" onChange={(event) => void addAttachments(event)} /><textarea aria-label={t("Message Pi")} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { const sendOnEnter = shortcutPreview === "enter" && event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey; const sendOnCtrlEnter = shortcutPreview === "ctrlEnter" && event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey; if (sendOnEnter || sendOnCtrlEnter) { event.preventDefault(); void promptSession(draft); } }} placeholder={activeSession ? t("Message Pi…") : t("Select or create a session to begin")} disabled={!activeSession} rows={3} />{attachments.length > 0 && <div className="attachment-previews" aria-label={t("Attachments")}>{attachments.map((attachment, index) => <div className="attachment-preview" key={`${attachment.name}-${index}`}>{attachment.type === "image" ? <img src={`data:${attachment.mimeType};base64,${attachment.data}`} alt={attachment.name} /> : <span className="attachment-text-icon" aria-hidden="true">▤</span>}<span className="attachment-file-details"><b title={attachment.name}>{attachment.name}</b><small>{formatFileSize(attachmentSize(attachment))}</small></span><button type="button" aria-label={`${t("Remove attachment")} ${attachment.name}`} onClick={() => removeAttachment(index)}>×</button></div>)}</div>}<div className="composer-bottom"><div className="composer-tools"><button type="button" title={t("Attach or reference file")} aria-label={t("Attach files")} onClick={() => attachmentInputRef.current?.click()}>＋</button><button type="button" onClick={() => openCatalog("skills")}>✳ <span>{t("Skills")}</span></button><button type="button" onClick={() => openCatalog("templates")}>▤ <span>{t("Template")}</span></button><button type="button" onClick={() => setModal("terminal")}>⌘ <span>{t("Terminal")}</span></button></div><div className="send-group"><span>{shortcutPreview === "enter" ? t("↵ to send · ⇧↵ for newline") : t("Ctrl+↵ to send · ↵ for newline")}</span>{activeSession?.status === "running" && <label className="delivery-mode-label">{t("Send as")}<select aria-label={t("Send as")} className="delivery-mode" value={sessionDelivery} onChange={(event) => setSessionDelivery(event.target.value as "steer" | "followUp")}><option value="steer">{t("Steer now")}</option><option value="followUp">{t("Follow up")}</option></select></label>}{activeSession?.status === "running" && <button type="submit" className="send-button" aria-label={t("Queue message")} title={t("Queue message")} disabled={!draft.trim() && attachments.length === 0}>↑</button>}{activeSession?.status === "running" && <button type="button" className="stop-button" onClick={() => void call("session.abort", { sessionId: activeSession.id })}>■ {t("Stop")}</button>}{activeSession && activeSession.status !== "running" && <button className="send-button" type="submit" aria-label={t("Send message")} disabled={!draft.trim() && attachments.length === 0}>↑</button>}</div></div></form><div className="composer-disclaimer">{t("Pi can make mistakes. Review changes before merging.")}</div>
+					<form className="composer" onSubmit={submitPrompt}><input ref={attachmentInputRef} className="attachment-file-input" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,text/*,.md,.markdown,.json,.jsonc,.yaml,.yml,.toml,.csv,.tsv,.log,.js,.jsx,.ts,.tsx,.css,.html,.xml,.py,.rs,.go,.java,.c,.h,.cpp,.hpp,.cs,.php,.rb,.sh,.sql,.env,.diff,.patch,.ini,.conf" onChange={(event) => void addAttachments(event)} /><textarea aria-label={t("Message Pi")} value={draft} onChange={(event) => setDraft(event.target.value)} maxLength={100_000} onCompositionStart={() => { composingRef.current = true; }} onCompositionEnd={() => { composingRef.current = false; }} onKeyDown={(event) => { if (!composingRef.current && shouldSendKey(event.nativeEvent, shortcutPreview)) { event.preventDefault(); void promptSession(); } }} placeholder={activeSession ? t("Message Pi…") : t("Select or create a session to begin")} disabled={!activeSession} rows={3} />{attachments.length > 0 && <div className="attachment-previews" aria-label={t("Attachments")}>{attachments.map((attachment, index) => <div className="attachment-preview" key={`${attachment.name}-${index}`}>{attachment.type === "image" ? <img src={`data:${attachment.mimeType};base64,${attachment.data}`} alt={attachment.name} /> : <span className="attachment-text-icon" aria-hidden="true">▤</span>}<span className="attachment-file-details"><b title={attachment.name}>{attachment.name}</b><small>{formatFileSize(attachmentSize(attachment))}</small></span><button type="button" aria-label={`${t("Remove attachment")} ${attachment.name}`} onClick={() => removeAttachment(index)}>×</button></div>)}</div>}<div className="composer-bottom"><div className="composer-tools"><button type="button" title={t("Attach or reference file")} aria-label={t("Attach files")} disabled={!activeSession} onClick={() => attachmentInputRef.current?.click()}>＋</button><button type="button" onClick={() => openCatalog("skills")}>✳ <span>{t("Skills")}</span></button><button type="button" onClick={() => openCatalog("templates")}>▤ <span>{t("Template")}</span></button><button type="button" onClick={() => setModal("terminal")}>⌘ <span>{t("Terminal")}</span></button></div><div className="send-group"><span>{shortcutPreview === "enter" ? t("↵ to send · ⇧↵ for newline") : t("Ctrl+↵ to send · ↵ for newline")}</span>{activeSession?.status === "running" && <label className="delivery-mode-label">{t("Send as")}<select aria-label={t("Send as")} className="delivery-mode" value={sessionDelivery} onChange={(event) => setSessionDelivery(event.target.value as "steer" | "followUp")}><option value="steer">{t("Steer now")}</option><option value="followUp">{t("Follow up")}</option></select></label>}{activeSession?.status === "running" && <button type="submit" className="send-button" aria-label={t("Queue message")} title={t("Queue message")} disabled={sending || (!draft.trim() && attachments.length === 0)}>↑</button>}{activeSession?.status === "running" && <button type="button" className="stop-button" onClick={() => void call("session.abort", { sessionId: activeSession.id })}>■ {t("Stop")}</button>}{activeSession && activeSession.status !== "running" && <button className="send-button" type="submit" aria-label={t("Send message")} disabled={sending || (!draft.trim() && attachments.length === 0)}>↑</button>}</div></div></form><div className="draft-status" role="status">{activeSession && (composer.persistenceFailed ? t("Draft kept in memory only. Local storage is unavailable.") : draft ? t("Text draft saved on this device") : "")}</div><div className="composer-disclaimer">{t("Pi can make mistakes. Review changes before merging.")}</div>
 				</div>
 			</section>
 
@@ -410,7 +445,7 @@ function ModalView(props: { modal: Exclude<Modal, null>; snapshot: AppSnapshot; 
 		{modal === "catalog" && <div className="modal-content catalog-content"><nav className="catalog-tabs" aria-label={t("Library category")}>{(["skills", "templates", "commands", "extensions"] as CatalogKind[]).map((kind) => <button type="button" className={kind === catalogKind ? "catalog-tab-active" : ""} onClick={() => onCatalogKindChange(kind)} key={kind}>{catalogTitle(kind, t)}</button>)}</nav><div className="catalog-diagnostic"><span>i</span><p>{t(catalogKind === "extensions" ? "Extensions are listed as sources. Run supported extension commands from Commands; terminal-only interfaces need a desktop adapter." : "Select or create a conversation session to use these items. Skills and templates insert into its draft; extension commands run in it.")}</p></div>{catalogItems.length === 0 ? <div className="empty-catalog"><div>✳</div><b>{language === "zh-CN" ? `暂无${catalogTitle(catalogKind, t)}` : `No ${catalogTitle(catalogKind, t).toLowerCase()} found`}</b><p>{t("Items are loaded from the active Pi configuration. Add them to your Pi user or project folder.")}</p></div> : <div className="catalog-list">{catalogItems.map((item) => <CatalogRow key={item.id} item={item} kind={catalogKind} disabled={!activeSessionId} t={t} onRun={async () => { const result = await call("catalog.run", { kind: catalogKind.slice(0, -1) as "skill" | "template" | "command" | "extension", id: item.id }); if (result.ok) { if (result.data.insertedText) { onInsertDraft(result.data.insertedText); onClose(); } else if (result.data.started) onClose(); } }} />)}</div>}</div>}
 		{modal === "open-project" && <div className="modal-content task-create-content"><form onSubmit={(event) => void run(event, async () => { if (!folderPath.trim()) return; const result = await call("project.open", { path: folderPath.trim() }); if (result.ok) { await call("session.create", { projectId: result.data.id }); await refresh(); onClose(); } })}><p className="modal-intro">{t("Choose a local repository folder. Pi Orbit keeps its sessions and tasks on this device.")}</p><label>{t("Folder path")}<input autoFocus required value={folderPath} onChange={(event) => setFolderPath(event.target.value)} placeholder="C:\\work\\project" /></label><div className="modal-footer"><button type="button" className="outline-button" onClick={onClose}>{t("Cancel")}</button><button className="primary-action" disabled={!folderPath.trim()}>{t("Open folder")}</button></div></form></div>}
 		{modal === "new-task" && <div className="modal-content task-create-content"><form onSubmit={(event) => void run(event, async () => { if (taskPrompt.trim() && activeProjectId) { const result = await call("task.create", { projectId: activeProjectId, roleId: taskRole, prompt: taskPrompt.trim(), dependsOn: dependencies }); if (result.ok) { await refresh(); onClose(); } } })}>{!activeProjectId ? <><p className="modal-intro">{t("Open a project before creating a task.")}</p><button type="button" className="outline-button" onClick={() => { onClose(); }}>{t("Close")}</button></> : <><p className="modal-intro">{t("The new agent runs in an isolated worktree and reports changes here for review.")}</p><label>{t("Role")}<select required value={taskRole} onChange={(event) => setTaskRole(event.target.value)}><option value="" disabled>{t("Select a role")}</option>{snapshot.roles.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.model || t("default model")}</option>)}</select></label>{snapshot.roles.length === 0 && <div className="inline-diagnostic">{t("Create an agent role before dispatching a task.")} <button className="text-button" type="button" onClick={onOpenRoles}>{t("Manage roles")}</button></div>}<label>{t("Task instructions")}<textarea required rows={5} value={taskPrompt} onChange={(event) => setTaskPrompt(event.target.value)} placeholder={t("Implement the settings screen and add focused tests…")} /></label><label>{t("Wait for tasks")}<select multiple value={dependencies} onChange={(event) => setDependencies(Array.from(event.target.selectedOptions, (option) => option.value))}>{snapshot.tasks.filter((task) => task.projectId === activeProjectId && !["failed", "cancelled"].includes(task.status)).map((task) => <option value={task.id} key={task.id}>{task.roleName}: {truncate(task.prompt, 48)}</option>)}</select><small>{t("Leave empty to run immediately. Failed prerequisites stop dependent tasks.")}</small></label><div className="form-note"><span>◈</span>{t("Up to 4 tasks run at the same time per project.")}</div><div className="modal-footer"><button type="button" className="outline-button" onClick={onClose}>{t("Cancel")}</button><button className="primary-action" disabled={!taskPrompt.trim() || !taskRole}>{t("Create task")} <span>→</span></button></div></>}</form></div>}
-				{modal === "terminal" && <div className="terminal-content"><div className="terminal-toolbar"><span className="terminal-leds"><i /><i /><i /></span><span>{snapshot.terminal?.title ?? t("Project terminal")}</span><span className={`task-status status-${snapshot.terminal?.state === "running" ? "running" : "queued"}`}>{snapshot.terminal?.state ? t(snapshot.terminal.state) : t("not started")}</span>{snapshot.terminal && <button className="text-button" onClick={() => void call("terminal.stop", { terminalId: snapshot.terminal!.id })}>{t("Stop")}</button>}</div><TerminalPane output={snapshot.terminal?.output ?? ""} terminalId={snapshot.terminal?.id} running={snapshot.terminal?.state === "running"} t={t} onInput={(text) => { if (snapshot.terminal?.id) void call("terminal.input", { terminalId: snapshot.terminal.id, text }); }} onResize={(cols, rows) => { if (snapshot.terminal?.id) void call("terminal.resize", { terminalId: snapshot.terminal.id, cols, rows }); }} /><form className="terminal-start" onSubmit={(event) => void run(event, async () => { if (!activeProjectId) return; const result = await call("terminal.start", { projectId: activeProjectId, command: terminalCommand || undefined }); if (result.ok) await refresh(); })}><label>{t("Start with command")}<input value={terminalCommand} onChange={(event) => setTerminalCommand(event.target.value)} placeholder={t("Leave blank for the project shell")} /></label><button className="primary-action" disabled={!activeProjectId || Boolean(snapshot.terminal?.state === "running")}>{t("Start")}</button></form></div>}
+				{modal === "terminal" && <div className="terminal-content"><div className="terminal-toolbar"><span className="terminal-leds"><i /><i /><i /></span><span>{snapshot.terminal?.title ?? t("Project terminal")}</span><span className={`task-status status-${snapshot.terminal?.state === "running" ? "running" : "queued"}`}>{snapshot.terminal?.state ? t(snapshot.terminal.state) : t("not started")}</span>{snapshot.terminal && <button className="text-button" onClick={() => void call("terminal.stop", { terminalId: snapshot.terminal!.id })}>{t("Stop")}</button>}</div><TerminalPane output={snapshot.terminal?.output ?? ""} outputOffset={snapshot.terminal?.outputOffset ?? 0} terminalId={snapshot.terminal?.id} running={snapshot.terminal?.state === "running"} t={t} onInput={(text) => { if (snapshot.terminal?.id) void call("terminal.input", { terminalId: snapshot.terminal.id, text }); }} onResize={(cols, rows) => { if (snapshot.terminal?.id) void call("terminal.resize", { terminalId: snapshot.terminal.id, cols, rows }); }} /><form className="terminal-start" onSubmit={(event) => void run(event, async () => { if (!activeProjectId) return; const result = await call("terminal.start", { projectId: activeProjectId, command: terminalCommand || undefined }); if (result.ok) await refresh(); })}><label>{t("Start with command")}<input value={terminalCommand} onChange={(event) => setTerminalCommand(event.target.value)} placeholder={t("Leave blank for the project shell")} /></label><button className="primary-action" disabled={!activeProjectId || Boolean(snapshot.terminal?.state === "running")}>{t("Start")}</button></form></div>}
 	</section></div>;
 }
 
@@ -443,7 +478,7 @@ function AuthFlowDialog({ event, t, call, onClose }: { event: AuthFlowEvent; t: 
 	</div></section></div>;
 }
 function CapabilityList({ capabilities, call, t }: { capabilities: AppSnapshot["capabilities"]; call: AppCall; t: Translate }) { return <div className="setting-section"><h3>{t("Pi capabilities")}</h3><div className="capability-grid">{Object.entries(capabilities).map(([name, capability]) => <div className="capability-row" key={name}><span className={capability.available ? "green-dot" : "amber-dot"} /><span><b>{name}</b><small>{capability.available ? t("Available") : capability.diagnostic ?? t("Not available")}</small></span>{!capability.available && <button className="text-button" onClick={() => void call("capability.open", { capability: name })}>{t("Details")}</button>}</div>)}</div></div>; }
-function TerminalPane({ output, terminalId, running, onInput, onResize, t }: { output: string; terminalId?: string; running: boolean; onInput: (text: string) => void; onResize: (cols: number, rows: number) => void; t: Translate }) {
+function TerminalPane({ output, outputOffset, terminalId, running, onInput, onResize, t }: { output: string; outputOffset: number; terminalId?: string; running: boolean; onInput: (text: string) => void; onResize: (cols: number, rows: number) => void; t: Translate }) {
 	const hostRef = useRef<HTMLDivElement>(null);
 	const terminalRef = useRef<Terminal | null>(null);
 	const outputCursor = useRef(0);
@@ -472,14 +507,13 @@ function TerminalPane({ output, terminalId, running, onInput, onResize, t }: { o
 		if (terminalIdRef.current !== terminalId) {
 			terminalIdRef.current = terminalId;
 			outputCursor.current = 0;
-			terminalRef.current.clear();
+			terminalRef.current.reset();
 		}
-		if (output.length < outputCursor.current) outputCursor.current = 0;
-		if (output.length > outputCursor.current) {
-			terminalRef.current.write(output.slice(outputCursor.current));
-			outputCursor.current = output.length;
-		}
-	}, [output, terminalId]);
+		const update = terminalOutputDelta({ output, outputOffset }, outputCursor.current);
+		if (update.reset) terminalRef.current.reset();
+		if (update.text) terminalRef.current.write(update.text);
+		outputCursor.current = update.cursor;
+	}, [output, outputOffset, terminalId]);
 	return <div className="terminal-screen"><div className="terminal-xterm" ref={hostRef} role="application" aria-label={t("Interactive project terminal")} />{!running && !output && <div className="terminal-placeholder">{t("Start a shell to use terminal applications such as vim and htop.")}</div>}</div>;
 }
 function CatalogRow({ item, kind, disabled, onRun, t }: { item: CatalogEntry; kind: CatalogKind; disabled: boolean; onRun: () => void; t: Translate }) {

@@ -37,6 +37,7 @@ import type {
 	DesktopSnapshot,
 	DesktopTask,
 } from "../shared/desktop-types.ts";
+import { appendTerminalOutput } from "../shared/terminal-output.ts";
 import { isWorkerMainRequest, type WorkerEvent, type WorkerMainRequest } from "../shared/worker-protocol.ts";
 import { recoverTaskDetail, type TaskDetail, TaskDetailStore } from "../team/task-details.ts";
 import { TeamTaskError, type TeamTaskRecord, TeamTaskStore } from "../team/task-store.ts";
@@ -347,7 +348,7 @@ export class DesktopAppService {
 				if (this.terminalState?.id === terminalId) {
 					this.terminalState = {
 						...this.terminalState,
-						output: `${this.terminalState.output}${output}`.slice(-1_000_000),
+						...appendTerminalOutput(this.terminalState, output),
 					};
 				}
 				void this.recordEvent("terminal.output", { terminalId, text: output });
@@ -542,9 +543,12 @@ export class DesktopAppService {
 				return { closing: true };
 			case "project.open": {
 				const input = payload as DesktopCommandPayload<"project.open">;
+				const previousProjectId = await this.registry.getActiveProjectId();
 				const project = await this.registry.openProject(input.path);
-				this.activeMessages = [];
-				this.catalogCache = EMPTY_CATALOG;
+				if (previousProjectId !== project.id) {
+					this.activeMessages = [];
+					this.catalogCache = EMPTY_CATALOG;
+				}
 				await this.emitSnapshot();
 				return this.projectView(project);
 			}
@@ -560,6 +564,16 @@ export class DesktopAppService {
 				return this.createSession(payload as DesktopCommandPayload<"session.create">);
 			case "session.select":
 				return this.selectSession((payload as DesktopCommandPayload<"session.select">).sessionId);
+			case "session.rename": {
+				const input = payload as DesktopCommandPayload<"session.rename">;
+				const title = input.title.trim();
+				if (!title || /[\u0000-\u001f\u007f]/.test(title))
+					throw new DesktopAppError("INVALID_ARGUMENT", "Session names must be 1–200 characters on a single line");
+				await this.requireSession(input.sessionId);
+				await this.registry.renameSession(input.sessionId, title);
+				await this.emitSnapshot();
+				return sessionView(await this.requireSession(input.sessionId));
+			}
 			case "session.prompt": {
 				const input = payload as DesktopCommandPayload<"session.prompt">;
 				validateSessionInput(input.text, input.attachments);
@@ -915,8 +929,9 @@ export class DesktopAppService {
 			const priorTools = (this.sessionMessageCache.get(id) ?? []).filter((message) =>
 				message.parts.some((part) => part.kind === "tool"),
 			);
-			this.activeMessages = [...restored, ...priorTools];
-			this.sessionMessageCache.set(id, this.activeMessages);
+			const messages = [...restored, ...priorTools];
+			this.sessionMessageCache.set(id, messages);
+			if ((await this.registry.getActiveSessionId()) === id) this.activeMessages = messages;
 			await this.refreshWorkerCatalog(key);
 		} else await this.ensureSessionWorker(id);
 		await this.emitSnapshot();
@@ -1156,7 +1171,7 @@ export class DesktopAppService {
 					if (provider) provider.configured = true;
 				}
 			}
-		this.providerCache = [...providers.values()].sort((a, b) => a.name.localeCompare(b.name));
+		const providerViews = [...providers.values()].sort((a, b) => a.name.localeCompare(b.name));
 		const resources = record(await this.workers.request(key, "resources.list", {}));
 		const entries = (value: unknown): DesktopCatalogEntry[] => {
 			if (!Array.isArray(value)) return [];
@@ -1182,6 +1197,8 @@ export class DesktopAppService {
 				];
 			});
 		};
+		if ((await this.activeSessionWorkerKey()) !== key) return;
+		this.providerCache = providerViews;
 		this.catalogCache = {
 			skills: entries(resources?.skills),
 			templates: entries(resources?.templates),
