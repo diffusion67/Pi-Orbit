@@ -1,8 +1,15 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { TerminalService, TerminalServiceError } from "../../src/main/terminal-service.ts";
+
+// Service tests inject FakePty; real native PTYs are exercised by installed-app smoke tests.
+vi.mock("node-pty", () => ({
+	spawn: () => {
+		throw new Error("TerminalService tests must inject a PTY spawner");
+	},
+}));
 
 class FakePty {
 	readonly writes: string[] = [];
@@ -40,6 +47,45 @@ class FakePty {
 }
 
 describe("TerminalService", () => {
+	it("uses the canonical project directory when started through a directory alias", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "pi-orbit-terminal-"));
+		const alias = `${directory}-alias`;
+		const spawn = vi.fn(() => new FakePty());
+		const service = new TerminalService({ spawn, onOutput: () => undefined, platform: "win32" });
+		try {
+			await symlink(directory, alias, process.platform === "win32" ? "junction" : "dir");
+			const canonicalCwd = await realpath(directory);
+			const handle = await service.start(alias);
+			expect(handle.cwd).toBe(canonicalCwd);
+			expect(spawn).toHaveBeenCalledWith(expect.any(String), ["/Q"], expect.objectContaining({ cwd: canonicalCwd }));
+		} finally {
+			service.closeAll();
+			await rm(alias, { recursive: true, force: true });
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	it.each([
+		{ SystemRoot: "D:\\Windows", expected: "D:\\Windows\\System32\\cmd.exe" },
+		{ SystemRoot: "", expected: "C:\\Windows\\System32\\cmd.exe" },
+	])("resolves the Windows shell independently of the host: $expected", async ({ SystemRoot, expected }) => {
+		const cwd = await mkdtemp(join(tmpdir(), "pi-orbit-terminal-"));
+		const spawn = vi.fn(() => new FakePty());
+		const service = new TerminalService({
+			spawn,
+			onOutput: () => undefined,
+			platform: "win32",
+			environment: { SystemRoot },
+		});
+		try {
+			await service.start(cwd);
+			expect(spawn).toHaveBeenCalledWith(expected, ["/Q"], expect.any(Object));
+		} finally {
+			service.closeAll();
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	it("starts an OS shell in the project directory and forwards PTY input, size, output, and exit", async () => {
 		const cwd = await mkdtemp(join(tmpdir(), "pi-orbit-terminal-"));
 		const pty = new FakePty();
@@ -54,12 +100,13 @@ describe("TerminalService", () => {
 			environment: { SystemRoot: "C:\\Windows" },
 		});
 		try {
+			const canonicalCwd = await realpath(cwd);
 			const handle = await service.start(cwd);
-			expect(handle).toMatchObject({ cwd, state: "running" });
+			expect(handle).toMatchObject({ cwd: canonicalCwd, state: "running" });
 			expect(spawned).toHaveBeenCalledWith(
 				"C:\\Windows\\System32\\cmd.exe",
 				["/Q"],
-				expect.objectContaining({ cwd, cols: 96, rows: 28, name: "xterm-256color" }),
+				expect.objectContaining({ cwd: canonicalCwd, cols: 96, rows: 28, name: "xterm-256color" }),
 			);
 			service.input(handle.id, "echo ready\r");
 			service.resize(handle.id, 120, 38);
