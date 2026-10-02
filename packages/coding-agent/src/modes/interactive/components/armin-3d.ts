@@ -13,15 +13,15 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.ts";
+import { ARMIN_HEIGHT, ARMIN_WIDTH, isArminPixel } from "./armin.ts";
 import { formatKeyText } from "./keybinding-hints.ts";
 
 /**
- * Fullscreen easter egg shown when the header logo is clicked. The current screen dissolves into braille dust,
- * spreading out from the logo, while the logo lifts off as a 3D object, flies to the center, grows, and spins.
- * Leaving plays the same timeline backwards, so the logo lands on the header and the screen reassembles.
+ * Fullscreen 3D version of the /arminsayshi easter egg. The current screen dissolves into braille dust, spreading
+ * out from the center, while Armin's bitmap, built from one cube per pixel, grows out of the center and spins.
+ * Leaving plays the same timeline backwards, so Armin shrinks away and the screen reassembles.
  *
- * The logo is ray cast per braille dot. A braille cell holds 2x4 dots and roughly square dots, so one logo
- * pixel (a half block) is exactly 2x2 dots and the header logo (4x2 cells) is 8x8 dots at the start.
+ * The cubes are ray cast per braille dot. A braille cell holds 2x4 roughly square dots.
  */
 
 type Rgb = readonly [number, number, number];
@@ -55,7 +55,6 @@ interface Star {
 interface LogoBox {
 	min: readonly [number, number, number];
 	max: readonly [number, number, number];
-	color: Rgb;
 }
 
 interface Pose {
@@ -68,31 +67,29 @@ interface Pose {
 	roll: number;
 }
 
-const CORAL: Rgb = [228, 138, 122];
-const BLUE: Rgb = [79, 142, 179];
-const YELLOW: Rgb = [234, 182, 93];
-
 const DEPTH = 0.7;
-const CAMERA_DISTANCE = 10;
+// Far enough that the perspective stays mild for a figure about 36 cubes tall.
+const CAMERA_DISTANCE = 80;
 const FLY_START = 0.1;
 const FLY_DURATION = 1.3;
+/** Braille dots per pixel when Armin appears, growing from a speck at the center. */
+const START_SCALE = 0.1;
 
-/** Grid position of a logo block: column and row in the 4x4 logo, and layer (-1, 0, 1) in depth. */
+/** Grid position of a block: column and row in the bitmap, and layer (-1, 0, 1) in depth. */
 type Cell3 = readonly [number, number, number];
 
-// The logo's pixels on a 4x4 grid. Each pixel is a block that the puzzle slides around.
-const LOGO_PIXELS = ["ccc.", "b.c.", "bb.y", "b..y"];
-const BLOCKS: Array<{ home: Cell3; color: Rgb }> = LOGO_PIXELS.flatMap((line, row) =>
-	[...line].flatMap((pixel, column) => {
-		const color = pixel === "c" ? CORAL : pixel === "b" ? BLUE : pixel === "y" ? YELLOW : undefined;
-		return color ? [{ home: [column, row, 0] as Cell3, color }] : [];
-	}),
-);
+// One block per foreground pixel of Armin's bitmap. Each is a block that the puzzle slides around.
+const BLOCKS: Array<{ home: Cell3 }> = [];
+for (let row = 0; row < ARMIN_HEIGHT; row++) {
+	for (let column = 0; column < ARMIN_WIDTH; column++) {
+		if (isArminPixel(column, row)) BLOCKS.push({ home: [column, row, 0] });
+	}
+}
 // Farthest distance of any block corner from the origin, with blocks on the outer depth layers.
-const LOGO_RADIUS = Math.hypot(2, 2, 1 + DEPTH / 2);
+const LOGO_RADIUS = Math.hypot(ARMIN_WIDTH / 2, ARMIN_HEIGHT / 2, 1 + DEPTH / 2);
 
-// The sliding puzzle: after the logo spun for a while, blocks slide into free neighboring cells, one step at
-// a time. Each cycle shuffles, flies every block back home, and holds the logo briefly.
+// The sliding puzzle: after Armin spun for a while, blocks slide into free neighboring cells, a few at a time.
+// Each cycle shuffles, flies every block back home, and holds the figure briefly.
 const PUZZLE_START = FLY_START + FLY_DURATION + 3;
 const PUZZLE_STEP = 0.3;
 const PUZZLE_STEPS = 12;
@@ -119,12 +116,12 @@ function shuffleSteps(cycle: number): Cell3[][] {
 	const lastMoved = new Set<number>();
 	let random = cycle * 7_919 + 1;
 	const next = () => hash(random++);
-	const key = ([x, y, z]: Cell3) => (z + 1) * 16 + y * 4 + x;
+	const key = ([x, y, z]: Cell3) => ((z + 1) * ARMIN_HEIGHT + y) * ARMIN_WIDTH + x;
 	for (let step = 0; step < PUZZLE_STEPS; step++) {
 		const occupied = new Set(positions.map(key));
 		const nextPositions = [...positions];
 		const moved = new Set<number>();
-		const moveCount = next() < 0.4 ? 2 : 1;
+		const moveCount = Math.round(BLOCKS.length * (0.03 + next() * 0.04));
 		for (let move = 0; move < moveCount; move++) {
 			const candidates: Array<{ block: number; target: Cell3 }> = [];
 			for (let block = 0; block < positions.length; block++) {
@@ -132,7 +129,7 @@ function shuffleSteps(cycle: number): Cell3[][] {
 				const [x, y, z] = positions[block]!;
 				for (const [dx, dy, dz] of PUZZLE_MOVES) {
 					const target: Cell3 = [x + dx, y + dy, z + dz];
-					if (target[0] < 0 || target[0] > 3 || target[1] < 0 || target[1] > 3) continue;
+					if (target[0] < 0 || target[0] >= ARMIN_WIDTH || target[1] < 0 || target[1] >= ARMIN_HEIGHT) continue;
 					if (target[2] < -1 || target[2] > 1 || occupied.has(key(target))) continue;
 					candidates.push({ block, target });
 				}
@@ -439,7 +436,7 @@ class LogoRaster {
 	/** Ray parameter of the nearest hit per dot; smaller is nearer. */
 	private depth = new Float32Array(0);
 	/** Face index + 1 of the nearest hit per dot, 0 for none. */
-	private faceIds = new Uint8Array(0);
+	private faceIds = new Uint16Array(0);
 	/** Cells written by the previous frame, cleared before the next one. */
 	private dirty: { minX: number; minY: number; maxX: number; maxY: number } | undefined;
 	/** Cells with a halo from the previous frame, cleared before the next one. */
@@ -450,6 +447,7 @@ class LogoRaster {
 		height: number,
 		pose: Pose,
 		boxes: readonly LogoBox[],
+		color: Rgb,
 		background: Rgb,
 		haloStrength: number,
 	): void {
@@ -465,7 +463,7 @@ class LogoRaster {
 			this.haloRgb = new Float32Array(width * height * 3);
 			this.haloDirty = undefined;
 			this.depth = new Float32Array(dotWidth * dotHeight).fill(Infinity);
-			this.faceIds = new Uint8Array(dotWidth * dotHeight);
+			this.faceIds = new Uint16Array(dotWidth * dotHeight);
 			this.dirty = undefined;
 		} else if (this.dirty) {
 			const { minX, minY, maxX, maxY } = this.dirty;
@@ -490,7 +488,7 @@ class LogoRaster {
 		// The camera sits at (0, 0, CAMERA_DISTANCE) in camera space; object space is the transpose rotation.
 		const origin = [m[6]! * CAMERA_DISTANCE, m[7]! * CAMERA_DISTANCE, m[8]! * CAMERA_DISTANCE];
 		const light = isLight(background);
-		const faces = this.visibleFaces(m, origin, pose, boxes, dotWidth, dotHeight, light);
+		const faces = this.visibleFaces(m, origin, pose, boxes, color, dotWidth, dotHeight, light);
 		if (faces.length === 0) return;
 		let minX = dotWidth;
 		let minY = dotHeight;
@@ -672,6 +670,7 @@ class LogoRaster {
 		origin: number[],
 		pose: Pose,
 		boxes: readonly LogoBox[],
+		color: Rgb,
 		dotWidth: number,
 		dotHeight: number,
 		lightBackground: boolean,
@@ -750,9 +749,9 @@ class LogoRaster {
 						vMin: box.min[v]!,
 						vMax: box.max[v]!,
 						...face,
-						red: Math.min(255, box.color[0] * light + specular),
-						green: Math.min(255, box.color[1] * light + specular),
-						blue: Math.min(255, box.color[2] * light + specular),
+						red: Math.min(255, color[0] * light + specular),
+						green: Math.min(255, color[1] * light + specular),
+						blue: Math.min(255, color[2] * light + specular),
 					});
 				}
 			}
@@ -761,21 +760,13 @@ class LogoRaster {
 	}
 }
 
-export interface PiLogoAnimationOptions {
-	/** The screen to dissolve, as rendered lines. */
-	screen: readonly string[];
-	/** Terminal cell of the header logo's top-left corner. */
-	logoColumn: number;
-	logoRow: number;
-}
-
 let playing = false;
 
 /**
  * Show the animation as a fullscreen overlay until it is dismissed. The overlay takes focus and mouse input and
  * returns focus when hidden, so the rest of the UI keeps running underneath untouched.
  */
-export async function playPiLogoAnimation(tui: TUI, options: PiLogoAnimationOptions): Promise<void> {
+export async function playArmin3d(tui: TUI, screen: readonly string[]): Promise<void> {
 	if (playing) return;
 	playing = true;
 	// Fading needs the terminal's actual default colors; the theme only knows its own.
@@ -786,23 +777,26 @@ export async function playPiLogoAnimation(tui: TUI, options: PiLogoAnimationOpti
 	const colors = {
 		foreground: toRgbTuple(reported.foreground, toRgb(theme.colors.text)),
 		background: toRgbTuple(reported.background, dark ? [0, 0, 0] : [255, 255, 255]),
+		armin: toRgb(theme.colors.accent),
 	};
 	if (tui.hasOverlay()) {
 		playing = false;
 		return;
 	}
-	const animation = new PiLogoAnimation(tui, options, colors, () => {
+	const animation = new Armin3d(tui, screen, colors, () => {
 		playing = false;
 		overlay.hide();
 	});
 	const overlay = tui.showOverlay(animation, { anchor: "top-left", width: "100%", maxHeight: "100%" });
 }
 
-export class PiLogoAnimation implements Component {
+export class Armin3d implements Component {
 	private readonly tui: TUI;
-	private readonly options: PiLogoAnimationOptions;
+	/** The screen to dissolve, as rendered lines. */
+	private readonly screen: readonly string[];
 	private readonly foreground: Rgb;
 	private readonly background: Rgb;
+	private readonly color: Rgb;
 	private readonly onDone: () => void;
 	private readonly startTime = performance.now();
 	private lastRender = performance.now();
@@ -821,14 +815,15 @@ export class PiLogoAnimation implements Component {
 
 	constructor(
 		tui: TUI,
-		options: PiLogoAnimationOptions,
-		colors: { foreground: Rgb; background: Rgb },
+		screen: readonly string[],
+		colors: { foreground: Rgb; background: Rgb; armin: Rgb },
 		onDone: () => void,
 	) {
 		this.tui = tui;
-		this.options = options;
+		this.screen = screen;
 		this.foreground = colors.foreground;
 		this.background = colors.background;
+		this.color = colors.armin;
 		this.onDone = onDone;
 		this.timer = setInterval(() => {
 			// Also stop when no longer rendered, e.g. when pi hides all overlays on exit.
@@ -915,12 +910,12 @@ export class PiLogoAnimation implements Component {
 
 		const boxes: LogoBox[] = BLOCKS.map((block, index) => {
 			const [dx, dy, dz] = offsets[index]!;
-			const x = block.home[0] - 2 + dx;
-			const y = block.home[1] - 2 + dy;
-			return { min: [x, y, dz - DEPTH / 2], max: [x + 1, y + 1, dz + DEPTH / 2], color: block.color };
+			const x = block.home[0] - ARMIN_WIDTH / 2 + dx;
+			const y = block.home[1] - ARMIN_HEIGHT / 2 + dy;
+			return { min: [x, y, dz - DEPTH / 2], max: [x + 1, y + 1, dz + DEPTH / 2] };
 		});
 		const logo = this.logo;
-		logo.render(width, height, pose, boxes, background, isLight(background) ? LIGHT_HALO_STRENGTH : 0);
+		logo.render(width, height, pose, boxes, this.color, background, isLight(background) ? LIGHT_HALO_STRENGTH : 0);
 		const halo = (index: number, base: Rgb | undefined): Rgb | undefined => {
 			const amount = logo.haloAmount[index]!;
 			if (amount <= 0) return base;
@@ -1094,17 +1089,12 @@ export class PiLogoAnimation implements Component {
 	}
 
 	private pose(width: number, height: number, progress: number, time: number): Pose {
-		// At the start the front face must cover exactly the header logo's 8x8 dots despite the perspective.
-		const startScale = (2 * (CAMERA_DISTANCE - DEPTH / 2)) / CAMERA_DISTANCE;
 		const reach = LOGO_RADIUS * (CAMERA_DISTANCE / (CAMERA_DISTANCE - LOGO_RADIUS));
-		const endScale = Math.max(startScale, Math.min(width * 2 * 0.35, (height * 4 - 8) * 0.48) / reach);
-		const startX = this.options.logoColumn * 2 + 4;
-		const startY = this.options.logoRow * 4 + 4;
-		const endX = width;
-		const endY = height * 2 - 2;
+		const startScale = START_SCALE;
+		const endScale = Math.max(startScale, Math.min(width * 2 * 0.45, (height * 4 - 8) * 0.48) / reach);
 		return {
-			centerX: startX + (endX - startX) * progress,
-			centerY: startY + (endY - startY) * progress,
+			centerX: width,
+			centerY: height * 2 - 2,
 			// Interpolate the zoom geometrically so it feels uniform.
 			scale: startScale * (endScale / startScale) ** progress,
 			yaw: spinAngle(time),
@@ -1152,10 +1142,10 @@ export class PiLogoAnimation implements Component {
 	}
 
 	private prepareCells(width: number, foreground: Rgb): ScreenCell[][] {
-		const cells = parseScreen(this.options.screen, width, foreground, this.background);
-		const centerX = this.options.logoColumn + 2;
-		const centerY = this.options.logoRow + 1;
+		const cells = parseScreen(this.screen, width, foreground, this.background);
 		const height = Math.max(1, this.tui.terminal.rows);
+		const centerX = width / 2;
+		const centerY = height / 2;
 		const farthest = Math.hypot(Math.max(centerX, width - centerX), Math.max(centerY, height - centerY) * 2);
 		for (let row = 0; row < cells.length; row++) {
 			const line = cells[row]!;
@@ -1172,20 +1162,6 @@ export class PiLogoAnimation implements Component {
 				}
 				cell.seed = row * 65_537 + column;
 				cell.ink = glyphInk(owner.text, seed);
-			}
-		}
-		// The 3D logo replaces the header logo.
-		for (let row = this.options.logoRow; row < this.options.logoRow + 2; row++) {
-			const line = cells[row];
-			if (!line) continue;
-			for (let column = this.options.logoColumn; column < this.options.logoColumn + 4; column++) {
-				const cell = line[column];
-				if (cell) {
-					cell.text = " ";
-					cell.width = 1;
-					cell.ink = 0;
-					cell.bg = undefined;
-				}
 			}
 		}
 		return cells;

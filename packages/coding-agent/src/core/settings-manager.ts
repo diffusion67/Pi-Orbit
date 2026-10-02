@@ -93,8 +93,8 @@ export interface WarningSettings {
 
 /**
  * How the codemode tool presents tools while it is active.
- * - `on`: declared tools that scripts can call get their codemode declaration appended to their
- *   description; the codemode description lists only the tools without `direct` exposure.
+ * - `on`: declared tools that scripts can call get a note on calling them from scripts appended to
+ *   their description; the codemode description lists only the tools without `direct` exposure.
  * - `only`: the codemode description lists every tool scripts can call, and active `direct` tools are
  *   not declared to the model.
  */
@@ -181,7 +181,7 @@ export interface Settings {
 	httpIdleTimeoutMs?: number; // HTTP header/body idle timeout in milliseconds; 0 disables it
 	cacheWarming?: CacheWarmingMode; // default: "streaming"; global only because each refresh costs money
 	websocketConnectTimeoutMs?: number; // WebSocket connect/open handshake timeout in milliseconds; 0 disables it
-	tuiMode?: TuiMode; // default: "regular"
+	tuiMode?: TuiMode; // default: "fullscreen"
 	fullscreenExitOutput?: FullscreenExitOutput; // default: "transcript"; no effect in regular TUI mode
 	fullscreenScrollbar?: ScrollViewScrollbar; // default: "auto"; no effect in regular TUI mode
 	fullscreenCopyOnSelect?: boolean; // default: true; no effect in regular TUI mode
@@ -1346,7 +1346,7 @@ export class SettingsManager {
 	}
 
 	getTuiMode(): TuiMode {
-		return this.settings.tuiMode === "fullscreen" ? "fullscreen" : "regular";
+		return this.settings.tuiMode === "regular" ? "regular" : "fullscreen";
 	}
 
 	setTuiMode(mode: TuiMode): void {

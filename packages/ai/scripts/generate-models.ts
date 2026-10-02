@@ -197,7 +197,12 @@ const TOGETHER_REASONING_ONLY_MODELS = new Set([
 	"MiniMaxAI/MiniMax-M2.7",
 ]);
 const TOGETHER_REASONING_EFFORT_MODELS = new Set(["openai/gpt-oss-20b", "openai/gpt-oss-120b"]);
-const TOGETHER_TOGGLE_REASONING_EFFORT_MODELS = new Set(["deepseek-ai/DeepSeek-V4-Pro"]);
+// Together's current Pro revision supports both the reasoning toggle and high/max effort.
+// https://docs.together.ai/docs/inference/chat/reasoning
+const TOGETHER_TOGGLE_REASONING_EFFORT_MODELS = new Set([
+	"deepseek-ai/DeepSeek-V4-Pro",
+	"deepseek-ai/DeepSeek-V4-Pro-0813",
+]);
 const TOGETHER_FIXED_REASONING_LEVEL_MAP = {
 	off: null,
 	minimal: null,
@@ -564,7 +569,12 @@ function getTogetherThinkingLevelMap(
 ): NonNullable<Model<any>["thinkingLevelMap"]> | undefined {
 	if (!reasoning) return undefined;
 	if (TOGETHER_REASONING_EFFORT_MODELS.has(modelId)) return { ...TOGETHER_REASONING_EFFORT_LEVEL_MAP };
-	if (TOGETHER_TOGGLE_REASONING_EFFORT_MODELS.has(modelId)) return { ...TOGETHER_DEEPSEEK_V4_THINKING_LEVEL_MAP };
+	if (TOGETHER_TOGGLE_REASONING_EFFORT_MODELS.has(modelId)) {
+		return {
+			...TOGETHER_DEEPSEEK_V4_THINKING_LEVEL_MAP,
+			...(modelId === "deepseek-ai/DeepSeek-V4-Pro-0813" ? { max: "max" } : {}),
+		};
+	}
 	if (TOGETHER_REASONING_ONLY_MODELS.has(modelId)) return { ...TOGETHER_FIXED_REASONING_LEVEL_MAP };
 	return { ...TOGETHER_TOGGLE_REASONING_LEVEL_MAP };
 }

@@ -127,7 +127,6 @@ export class Client {
 
 	connect(): Promise<ServerHello> {
 		if (this.#disposed) return Promise.reject(new ClientDisposedError());
-		this.#hello = undefined;
 		return this.#connection.connect();
 	}
 
@@ -196,6 +195,12 @@ export class Client {
 				signal,
 				(result) => {
 					const decoded = active.decoder.decodeSnapshot(parseWireServiceSubscriptionSnapshot(result));
+					// Wait for success so unsubscribe cannot overtake an installation still in progress.
+					if (signal?.aborted && this.connected && this.#targetIsCurrent(target)) {
+						void this.#request(target, createServiceUnsubscribeCall(subscriptionId)).catch((error: unknown) =>
+							this.#reportListenerError(error),
+						);
+					}
 					active.hydrated = true;
 					for (const update of active.queuedWireUpdates.splice(0)) {
 						active.queued.push(active.decoder.decodeUpdate(parseWireServiceProviderUpdate(update)));

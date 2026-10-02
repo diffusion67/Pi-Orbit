@@ -25,9 +25,13 @@ Vite. It manages local projects and Pi sessions, model credentials, interactive
 terminals, MCP servers, and agent tasks in Git worktrees. Desktop development and
 packaging details are in [packages/desktop/README.md](packages/desktop/README.md).
 
-The desktop revision based on Pi commit `8ce69e9` passed a local unsigned Windows
-installed-app smoke on 2026-10-01. Later syncs, macOS, and Linux installed artifacts still need native CI checks,
-and public distribution requires signing and macOS notarization.
+The desktop at commit `906994972` passed native Windows, macOS, and Linux
+packaging and installed-app smoke checks on 2026-10-01
+([verified run](https://github.com/diffusion67/Pi-Orbit/actions/runs/36880990428)).
+Desktop prereleases may be published unsigned and, on macOS, without notarization;
+operating systems may show publisher warnings or block them. Each release lists
+its exact source commit, tested architectures, checksums, and signing status.
+The release workflow requires fresh checks for that release's source commit.
 
 To learn more about Pi:
 

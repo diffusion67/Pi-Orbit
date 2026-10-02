@@ -101,8 +101,18 @@ class FakeWorker implements WorkerTransport {
 	exit(code = 1): void {
 		this.exitListener?.(code);
 	}
+	get runId(): string | undefined {
+		const payload = this.requests.findLast((request) => request.type === "prompt")?.payload;
+		return payload && typeof payload === "object" && "runId" in payload && typeof payload.runId === "string"
+			? payload.runId
+			: undefined;
+	}
 	emit(event: unknown): void {
-		this.messageListener?.({ type: "event", event });
+		const tagged =
+			event && typeof event === "object" && "type" in event && event.type === "state"
+				? { runId: this.runId, outcome: "completed", ...event }
+				: event;
+		this.messageListener?.({ type: "event", event: tagged });
 	}
 }
 
@@ -143,6 +153,481 @@ afterEach(async () => {
 });
 
 describe("desktop app service", () => {
+	it("keeps replacement dialogs and task state intact when an old worker exit is delayed", async () => {
+		const paths = await repository();
+		const workers: FakeWorker[] = [];
+		let releaseInit: (() => void) | undefined;
+		let releaseEvents = () => {};
+		const service = await DesktopAppService.open({
+			...paths,
+			createWorkerTransport: () => {
+				const worker = new FakeWorker();
+				const post = worker.postMessage.bind(worker);
+				if (workers.length === 1)
+					worker.postMessage = (message) => {
+						if (message && typeof message === "object" && "type" in message && message.type === "init") {
+							releaseInit = () => post(message);
+							worker.emit({
+								type: "ui.request",
+								requestId: "startup",
+								kind: "confirm",
+								title: "Replacement",
+								message: "Continue?",
+							});
+							return;
+						}
+						post(message);
+					};
+				workers.push(worker);
+				return worker;
+			},
+		});
+		let resuming: ReturnType<DesktopAppService["invoke"]> | undefined;
+		try {
+			const opened = await service.invoke("project.open", { path: paths.projectPath });
+			assert.ok(opened.ok);
+			assert.ok(
+				(
+					await service.invoke("role.save", {
+						id: "user:coder",
+						name: "Coder",
+						description: "",
+						systemPrompt: "Work",
+						model: "",
+						tools: [],
+						scope: "user",
+					})
+				).ok,
+			);
+			const created = await service.invoke("task.create", {
+				projectId: (opened.data as { id: string }).id,
+				roleId: "user:coder",
+				prompt: "Work",
+				dependsOn: [],
+			});
+			assert.ok(created.ok);
+			const taskId = (created.data as { id: string }).id;
+			assert.ok((await service.invoke("task.pause", { taskId })).ok);
+			const events: DesktopEvent[] = [];
+			await service.subscribe((await service.snapshot()).lastEventSeq, (event) => events.push(event));
+			workers[0]!.emit({
+				type: "ui.request",
+				requestId: "startup",
+				kind: "confirm",
+				title: "Original",
+				message: "Continue?",
+			});
+			const oldRequest = await settled(
+				async () => events.find((event) => event.type === "extension.request"),
+				Boolean,
+			);
+			assert.ok(oldRequest?.type === "extension.request");
+			const gate = new Promise<void>((resolve) => {
+				releaseEvents = resolve;
+			});
+			const internal = service as unknown as { workerEventTail: Promise<void> };
+			internal.workerEventTail = gate;
+			workers[0]!.exit(1);
+			resuming = service.invoke("task.resume", { taskId });
+			const request = await settled(
+				async () =>
+					events.find((event) => event.type === "extension.request" && event.request.title === "Replacement"),
+				Boolean,
+			);
+			assert.ok(request?.type === "extension.request");
+			assert.notEqual(
+				request.request.id,
+				oldRequest.request.id,
+				"new worker requests must have a new public identity",
+			);
+			assert.equal(
+				(await service.invoke("extension.ui.respond", { requestId: oldRequest.request.id, value: true })).ok,
+				false,
+			);
+			releaseEvents();
+			releaseInit!();
+			releaseInit = undefined;
+			assert.ok((await resuming).ok);
+			await internal.workerEventTail;
+			assert.equal((await service.snapshot()).tasks.find((task) => task.id === taskId)?.status, "running");
+			const response = await service.invoke("extension.ui.respond", { requestId: request.request.id, value: true });
+			assert.ok(response.ok, "the previous worker's exit must not dismiss the replacement dialog");
+		} finally {
+			releaseEvents();
+			releaseInit?.();
+			await resuming;
+			await service.close();
+		}
+	});
+
+	for (const transition of ["pause", "completed", "failed", "shutdown"] as const) {
+		it(`delivers replacement worker startup dialogs after ${transition}`, async () => {
+			const paths = await repository();
+			const workers: FakeWorker[] = [];
+			let releaseInit: (() => void) | undefined;
+			const service = await DesktopAppService.open({
+				...paths,
+				createWorkerTransport: () => {
+					const worker = new FakeWorker();
+					const needsConfirmation = workers.length === 4;
+					const post = worker.postMessage.bind(worker);
+					worker.postMessage = (message) => {
+						if (message && typeof message === "object" && "type" in message) {
+							if (message.type === "abort") worker.emit({ type: "state", state: "idle", outcome: "aborted" });
+							if (needsConfirmation && message.type === "init") {
+								releaseInit = () => post(message);
+								worker.emit({
+									type: "ui.request",
+									requestId: "startup",
+									kind: "confirm",
+									title: "Startup",
+									message: "Continue?",
+								});
+								return;
+							}
+							if (message.type === "ui.resolve") releaseInit?.();
+						}
+						post(message);
+					};
+					workers.push(worker);
+					return worker;
+				},
+			});
+			let pausing: ReturnType<DesktopAppService["invoke"]> | undefined;
+			let closing: Promise<void> | undefined;
+			let unsubscribe = () => {};
+			try {
+				const opened = await service.invoke("project.open", { path: paths.projectPath });
+				assert.ok(opened.ok);
+				const projectId = (opened.data as { id: string }).id;
+				assert.ok(
+					(
+						await service.invoke("role.save", {
+							id: "user:coder",
+							name: "Coder",
+							description: "",
+							systemPrompt: "Work",
+							model: "",
+							tools: [],
+							scope: "user",
+						})
+					).ok,
+				);
+				const taskIds: string[] = [];
+				for (let index = 0; index < 5; index++) {
+					const created = await service.invoke("task.create", {
+						projectId,
+						roleId: "user:coder",
+						prompt: `Work ${index}`,
+						dependsOn: [],
+					});
+					assert.ok(created.ok);
+					taskIds.push((created.data as { id: string }).id);
+				}
+				let receivedDialog = false;
+				unsubscribe = await service.subscribe((await service.snapshot()).lastEventSeq, (event) => {
+					if (event.type !== "extension.request") return;
+					receivedDialog = true;
+					if (transition === "shutdown") return;
+					void service.invoke("extension.ui.respond", { requestId: event.request.id, value: true });
+				});
+				if (transition === "pause") pausing = service.invoke("task.pause", { taskId: taskIds[0]! });
+				else workers[0]!.emit({ type: "state", state: transition === "failed" ? "failed" : "idle" });
+				await settled(
+					async () => receivedDialog,
+					(value) => value,
+				);
+				if (transition === "shutdown") {
+					closing = service.close();
+					const closed = await Promise.race([
+						closing.then(() => true),
+						new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_000)),
+					]);
+					assert.equal(closed, true, "shutdown must stop workers rather than await an unanswered dialog");
+					return;
+				}
+				if (pausing) assert.ok((await pausing).ok);
+				await settled(
+					async () => workers[4]?.requests.filter((request) => request.type === "prompt").length,
+					(value) => value === 1,
+				);
+				assert.equal(workers[4]?.requests.filter((request) => request.type === "prompt").length, 1);
+			} finally {
+				unsubscribe();
+				releaseInit?.();
+				await pausing;
+				await closing;
+				await service.close();
+			}
+		});
+	}
+
+	// PR #5 review: serialize pause/resume and fence terminal events by run identity.
+	it("delivers startup dialogs when resuming an exited worker despite its stale terminal event", async () => {
+		const paths = await repository();
+		const workers: FakeWorker[] = [];
+		let releaseInit: (() => void) | undefined;
+		const service = await DesktopAppService.open({
+			...paths,
+			createWorkerTransport: () => {
+				const worker = new FakeWorker();
+				if (workers.length === 1) {
+					const post = worker.postMessage.bind(worker);
+					worker.postMessage = (message) => {
+						if (message && typeof message === "object" && "type" in message) {
+							if (message.type === "init") {
+								releaseInit = () => post(message);
+								workers[0]!.emit({ type: "state", state: "idle" });
+								worker.emit({
+									type: "ui.request",
+									requestId: "resume-startup",
+									kind: "confirm",
+									title: "Resume",
+									message: "Continue?",
+								});
+								return;
+							}
+							if (message.type === "ui.resolve") releaseInit?.();
+						}
+						post(message);
+					};
+				}
+				workers.push(worker);
+				return worker;
+			},
+		});
+		let resuming: ReturnType<DesktopAppService["invoke"]> | undefined;
+		let unsubscribe = () => {};
+		try {
+			const opened = await service.invoke("project.open", { path: paths.projectPath });
+			assert.ok(opened.ok);
+			assert.ok(
+				(
+					await service.invoke("role.save", {
+						id: "user:coder",
+						name: "Coder",
+						description: "",
+						systemPrompt: "Work",
+						model: "",
+						tools: [],
+						scope: "user",
+					})
+				).ok,
+			);
+			const created = await service.invoke("task.create", {
+				projectId: (opened.data as { id: string }).id,
+				roleId: "user:coder",
+				prompt: "Work",
+				dependsOn: [],
+			});
+			assert.ok(created.ok);
+			const taskId = (created.data as { id: string }).id;
+			workers[0]!.exit(1);
+			await settled(
+				() => service.snapshot(),
+				(snapshot) => snapshot.tasks.find((task) => task.id === taskId)?.status === "review",
+			);
+			let receivedDialog = false;
+			unsubscribe = await service.subscribe((await service.snapshot()).lastEventSeq, (event) => {
+				if (event.type !== "extension.request") return;
+				receivedDialog = true;
+				void service.invoke("extension.ui.respond", { requestId: event.request.id, value: true });
+			});
+			resuming = service.invoke("task.resume", { taskId });
+			await settled(
+				async () => receivedDialog,
+				(value) => value,
+			);
+			assert.ok((await resuming).ok);
+			assert.equal((await service.snapshot()).tasks.find((task) => task.id === taskId)?.status, "running");
+		} finally {
+			unsubscribe();
+			releaseInit?.();
+			await resuming;
+			await service.close();
+		}
+	});
+
+	it("waits for an in-flight pause before resuming the same task", async () => {
+		const paths = await repository();
+		const worker = new FakeWorker();
+		const service = await DesktopAppService.open({ ...paths, createWorkerTransport: () => worker });
+		let releaseAbort: (() => void) | undefined;
+		try {
+			const opened = await service.invoke("project.open", { path: paths.projectPath });
+			assert.ok(opened.ok);
+			assert.ok(
+				(
+					await service.invoke("role.save", {
+						id: "user:coder",
+						name: "Coder",
+						description: "",
+						systemPrompt: "Work",
+						model: "",
+						tools: [],
+						scope: "user",
+					})
+				).ok,
+			);
+			const created = await service.invoke("task.create", {
+				projectId: (opened.data as { id: string }).id,
+				roleId: "user:coder",
+				prompt: "Work",
+				dependsOn: [],
+			});
+			assert.ok(created.ok);
+			const taskId = (created.data as { id: string }).id;
+			const post = worker.postMessage.bind(worker);
+			worker.postMessage = (message) => {
+				if (message && typeof message === "object" && "type" in message && message.type === "abort")
+					releaseAbort = () => {
+						worker.emit({ type: "state", state: "idle", outcome: "aborted" });
+						post(message);
+					};
+				else post(message);
+			};
+			const paused = service.invoke("task.pause", { taskId });
+			await settled(
+				async () => releaseAbort,
+				(value) => Boolean(value),
+			);
+			const resumed = service.invoke("task.resume", { taskId });
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			assert.equal(worker.requests.filter((request) => request.type === "prompt").length, 1);
+			releaseAbort!();
+			releaseAbort = undefined;
+			assert.ok((await paused).ok);
+			assert.ok((await resumed).ok);
+			assert.equal((await service.snapshot()).tasks.find((task) => task.id === taskId)?.status, "running");
+		} finally {
+			releaseAbort?.();
+			await service.close();
+		}
+	});
+
+	it("ignores previous-run terminal events and blocks dependencies on the current run failure", async () => {
+		const paths = await repository();
+		const workers: FakeWorker[] = [];
+		const service = await DesktopAppService.open({
+			...paths,
+			createWorkerTransport: () => {
+				const worker = new FakeWorker();
+				workers.push(worker);
+				return worker;
+			},
+		});
+		try {
+			const opened = await service.invoke("project.open", { path: paths.projectPath });
+			assert.ok(opened.ok);
+			const projectId = (opened.data as { id: string }).id;
+			assert.ok(
+				(
+					await service.invoke("role.save", {
+						id: "user:coder",
+						name: "Coder",
+						description: "",
+						systemPrompt: "Work",
+						model: "",
+						tools: [],
+						scope: "user",
+					})
+				).ok,
+			);
+			const created = await service.invoke("task.create", {
+				projectId,
+				roleId: "user:coder",
+				prompt: "Work",
+				dependsOn: [],
+			});
+			assert.ok(created.ok);
+			const taskId = (created.data as { id: string }).id;
+			const child = await service.invoke("task.create", {
+				projectId,
+				roleId: "user:coder",
+				prompt: "Dependent",
+				dependsOn: [taskId],
+			});
+			assert.ok(child.ok);
+			const childId = (child.data as { id: string }).id;
+			const worker = workers[0]!;
+			const previousRunId = worker.runId ?? "old-run";
+			assert.ok((await service.invoke("task.pause", { taskId })).ok);
+			assert.ok((await service.invoke("task.resume", { taskId })).ok);
+			worker.emit({ type: "state", state: "idle", runId: previousRunId });
+			worker.emit({ type: "state", state: "failed", runId: previousRunId, message: "old failure" });
+			worker.emit({ type: "ui.update", update: "status", key: "barrier", message: "processed" });
+			const snapshot = await settled(
+				() => service.snapshot(),
+				(value) => value.extensionUi[`task:${taskId}`]?.status.barrier === "processed",
+			);
+			assert.equal(snapshot.tasks.find((task) => task.id === taskId)?.status, "running");
+			assert.equal(snapshot.tasks.find((task) => task.id === childId)?.status, "queued");
+			assert.notEqual(worker.runId, previousRunId);
+			worker.emit({ type: "state", state: "failed", message: "invalid_api_key" });
+			const failed = await settled(
+				() => service.snapshot(),
+				(value) => value.tasks.find((task) => task.id === taskId)?.status === "failed",
+			);
+			assert.equal(failed.tasks.find((task) => task.id === childId)?.status, "failed");
+			assert.equal(workers.length, 1);
+		} finally {
+			await service.close();
+		}
+	});
+
+	it("keeps an aborted task in review without releasing its dependency", async () => {
+		const paths = await repository();
+		const worker = new FakeWorker();
+		let workerCount = 0;
+		const service = await DesktopAppService.open({
+			...paths,
+			createWorkerTransport: () => (workerCount++ === 0 ? worker : new FakeWorker()),
+		});
+		try {
+			const opened = await service.invoke("project.open", { path: paths.projectPath });
+			assert.ok(opened.ok);
+			const projectId = (opened.data as { id: string }).id;
+			assert.ok(
+				(
+					await service.invoke("role.save", {
+						id: "user:coder",
+						name: "Coder",
+						description: "",
+						systemPrompt: "Work",
+						model: "",
+						tools: [],
+						scope: "user",
+					})
+				).ok,
+			);
+			const created = await service.invoke("task.create", {
+				projectId,
+				roleId: "user:coder",
+				prompt: "Work",
+				dependsOn: [],
+			});
+			assert.ok(created.ok);
+			const taskId = (created.data as { id: string }).id;
+			const child = await service.invoke("task.create", {
+				projectId,
+				roleId: "user:coder",
+				prompt: "Dependent",
+				dependsOn: [taskId],
+			});
+			assert.ok(child.ok);
+			worker.emit({ type: "state", state: "idle", outcome: "aborted" });
+			const snapshot = await settled(
+				() => service.snapshot(),
+				(value) => value.tasks.find((task) => task.id === taskId)?.status !== "running",
+			);
+			assert.equal(snapshot.tasks.find((task) => task.id === taskId)?.status, "review");
+			assert.equal(snapshot.tasks.find((task) => task.id === (child.data as { id: string }).id)?.status, "queued");
+			assert.ok((await service.invoke("task.resume", { taskId })).ok);
+		} finally {
+			await service.close();
+		}
+	});
+
 	it("validates session names and restores renames after restart", async () => {
 		const paths = await repository();
 		const options = {
@@ -417,7 +902,10 @@ describe("desktop app service", () => {
 			);
 			assert.ok(
 				dialogEvents.some(
-					(event) => event.type === "extension.dismiss" && event.requestId === `session:${id}:dialog-1`,
+					(event) =>
+						event.type === "extension.dismiss" &&
+						event.requestId?.startsWith(`session:${id}:`) &&
+						event.requestId.endsWith(":dialog-1"),
 				),
 			);
 		} finally {

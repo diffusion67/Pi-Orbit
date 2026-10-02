@@ -276,9 +276,12 @@ export class DesktopAppService {
 	private readonly workers: AgentWorkerManager;
 	private readonly terminalService?: TerminalService;
 	private terminalState?: NonNullable<DesktopSnapshot["terminal"]>;
-	private readonly pendingUiRequests = new Set<string>();
+	private readonly pendingUiRequests = new Map<string, { key: string; requestId: string; generation: string }>();
+	private readonly workerGenerations = new Map<string, string>();
 	private readonly listeners = new Set<Listener>();
 	private readonly taskDetails = new Map<string, TaskDetail>();
+	private readonly taskRunIds = new Map<string, string>();
+	private readonly taskControlTails = new Map<string, Promise<unknown>>();
 	private readonly messageIds = new Map<string, string>();
 	private readonly sessionMessageCache = new Map<string, DesktopChatMessage[]>();
 	private readonly extensionUi = new Map<string, DesktopExtensionUiState>();
@@ -295,6 +298,7 @@ export class DesktopAppService {
 	private catalogCache: DesktopSnapshot["catalog"] = EMPTY_CATALOG;
 	private lastPublished = 0;
 	private workerEventTail: Promise<void> = Promise.resolve();
+	private workerUiEventTail: Promise<void> = Promise.resolve();
 	private eventPublishTail: Promise<void> = Promise.resolve();
 	private closing = false;
 
@@ -321,20 +325,37 @@ export class DesktopAppService {
 		this.workers = new AgentWorkerManager({
 			createProcess: options.createWorkerTransport,
 			onEvent: (key, event) => {
+				const generation = this.workerGenerations.get(key);
+				if (!generation) return;
 				if (event.type === "main.request") {
 					void this.handleMainRequest(key, event).catch((error: unknown) => {
 						this.emitDiagnostic("MAIN_REQUEST_FAILED", error instanceof Error ? error.message : String(error));
 					});
 					return;
 				}
+				if (event.type === "ui.request" || event.type === "ui.dismiss") {
+					// Starting or stopping a worker can await an extension dialog. Deliver
+					// dialogs in their own ordered queue, independent of lifecycle operations.
+					this.workerUiEventTail = this.workerUiEventTail
+						.then(() => this.handleWorkerEvent(key, event, generation))
+						.catch((error: unknown) => {
+							this.emitDiagnostic(
+								"WORKER_UI_EVENT_FAILED",
+								error instanceof Error ? error.message : String(error),
+							);
+						});
+					return;
+				}
 				this.workerEventTail = this.workerEventTail
-					.then(() => this.handleWorkerEvent(key, event))
+					.then(() => this.handleWorkerEvent(key, event, generation))
 					.catch((error: unknown) => {
 						this.emitDiagnostic("WORKER_EVENT_FAILED", error instanceof Error ? error.message : String(error));
 					});
 			},
 			onUnexpectedExit: (key, code) => {
-				this.workerEventTail = this.workerEventTail.then(() => this.handleWorkerExit(key, code));
+				const generation = this.workerGenerations.get(key);
+				if (!generation) return;
+				this.workerEventTail = this.workerEventTail.then(() => this.handleWorkerExit(key, code, generation));
 				this.workerEventTail = this.workerEventTail.catch((error: unknown) => {
 					this.emitDiagnostic(
 						"WORKER_EXIT_HANDLING_FAILED",
@@ -391,10 +412,13 @@ export class DesktopAppService {
 		for (const prompt of this.pendingAuthPrompts.values()) prompt.reject(new Error("Login cancelled"));
 		this.pendingAuthPrompts.clear();
 		this.terminalService?.closeAll();
-		await this.workerEventTail;
-		for (const requestId of [...this.pendingUiRequests]) await this.dismissPendingUiRequest(requestId);
+		// A lifecycle event may be waiting for a worker's startup dialog. Stop those
+		// workers first, then drain the operations their exit settles.
 		await this.workers.stopAll();
 		await this.workerEventTail;
+		await this.workerUiEventTail;
+		await Promise.allSettled([...this.taskControlTails.values()]);
+		for (const requestId of [...this.pendingUiRequests.keys()]) await this.dismissPendingUiRequest(requestId);
 		await this.eventPublishTail;
 		await this.team.close();
 		this.listeners.clear();
@@ -816,12 +840,11 @@ export class DesktopAppService {
 			}
 			case "extension.ui.respond": {
 				const input = payload as DesktopCommandPayload<"extension.ui.respond">;
-				if (!this.pendingUiRequests.delete(input.requestId))
-					throw new DesktopAppError("UI_REQUEST_NOT_FOUND", "This extension dialog has expired");
-				const separator = input.requestId.lastIndexOf(":");
-				const key = input.requestId.slice(0, separator);
-				const requestId = input.requestId.slice(separator + 1);
-				if (!this.workers.has(key))
+				const pending = this.pendingUiRequests.get(input.requestId);
+				if (!pending) throw new DesktopAppError("UI_REQUEST_NOT_FOUND", "This extension dialog has expired");
+				this.pendingUiRequests.delete(input.requestId);
+				const { key, requestId, generation } = pending;
+				if (!this.workers.has(key) || this.workerGenerations.get(key) !== generation)
 					throw new DesktopAppError("WORKER_NOT_RUNNING", "The extension session has closed");
 				const value = input.value;
 				if (value !== null && typeof value !== "string" && typeof value !== "boolean")
@@ -883,7 +906,7 @@ export class DesktopAppService {
 		const sessionId = randomUUID();
 		const tempKey = `session:${randomUUID()}`;
 		const init = workerInit(
-			await this.workers.start(tempKey, {
+			await this.startWorker(tempKey, {
 				cwd: project.path,
 				agentDir: this.agentDirectory,
 				sessionId,
@@ -945,7 +968,7 @@ export class DesktopAppService {
 		const project = await this.registry.getProject(session.projectId);
 		if (!project) throw new DesktopAppError("PROJECT_NOT_FOUND", "Session project no longer exists");
 		const init = workerInit(
-			await this.workers.start(key, {
+			await this.startWorker(key, {
 				cwd: project.path,
 				agentDir: this.agentDirectory,
 				sessionFile: session.file,
@@ -1267,15 +1290,17 @@ export class DesktopAppService {
 	}
 
 	private async scheduleTasks(projectId: string): Promise<void> {
-		while (true) {
+		while (!this.closing) {
 			const started = await this.team.startReadyTasks(projectId, 4);
 			await this.publishCommitted();
 			if (started.length === 0) return;
 			let startFailed = false;
 			for (const task of started) {
+				if (this.closing) return;
 				try {
 					await this.startTask(task);
 				} catch (error) {
+					if (this.closing) return;
 					await this.workers.stop(`task:${task.id}`).catch((stopError: unknown) => {
 						this.emitDiagnostic(
 							"TASK_STOP_FAILED",
@@ -1297,9 +1322,10 @@ export class DesktopAppService {
 		if (!project || !task.worktreePath) throw new DesktopAppError("TASK_INVALID", "Task has no project worktree");
 		const role = (await this.roles.list(project.path)).find((item) => item.id === task.roleId);
 		if (!role) throw new DesktopAppError("ROLE_NOT_FOUND", "Task role no longer exists");
+		if (this.closing) throw new DesktopAppError("SHUTTING_DOWN", "Application is closing");
 		const key = `task:${task.id}`;
 		const init = workerInit(
-			await this.workers.start(key, {
+			await this.startWorker(key, {
 				cwd: task.worktreePath,
 				agentDir: this.agentDirectory,
 				...(task.sessionFile ? { sessionFile: task.sessionFile } : {}),
@@ -1310,58 +1336,92 @@ export class DesktopAppService {
 		);
 		if (init.sessionFile) await this.team.updateTask(task.id, { sessionFile: init.sessionFile });
 		await this.publishCommitted();
-		await this.workers.request(key, "prompt", {
-			text: task.sessionFile ? "Continue this task from the last settled step." : task.prompt,
+		await this.promptTask(task.id, task.sessionFile ? "Continue this task from the last settled step." : task.prompt);
+	}
+
+	private async startWorker(key: string, payload: unknown): Promise<unknown> {
+		if (this.workers.has(key)) throw new WorkerRequestError("ALREADY_RUNNING", `Worker ${key} is already running`);
+		const generation = randomUUID();
+		this.workerGenerations.set(key, generation);
+		// Replacing a worker expires its dialogs before fresh requests can reach the UI.
+		for (const [id, pending] of [...this.pendingUiRequests]) {
+			if (pending.key === key) await this.dismissPendingUiRequest(id);
+		}
+		if (this.closing) throw new DesktopAppError("SHUTTING_DOWN", "Application is closing");
+		if (this.workerGenerations.get(key) !== generation)
+			throw new WorkerRequestError("ALREADY_RUNNING", `Worker ${key} was replaced while starting`);
+		return this.workers.start(key, payload);
+	}
+
+	private async promptTask(id: string, text: string): Promise<void> {
+		if (this.closing) throw new DesktopAppError("SHUTTING_DOWN", "Application is closing");
+		const runId = randomUUID();
+		this.taskRunIds.set(id, runId);
+		await this.workers.request(`task:${id}`, "prompt", { text, runId });
+	}
+
+	private withTaskControl<T>(id: string, action: () => Promise<T>): Promise<T> {
+		const operation = (this.taskControlTails.get(id) ?? Promise.resolve()).catch(() => {}).then(action);
+		this.taskControlTails.set(id, operation);
+		return operation.finally(() => {
+			if (this.taskControlTails.get(id) === operation) this.taskControlTails.delete(id);
 		});
 	}
 
-	private async pauseTask(id: string): Promise<DesktopTask> {
-		const task = await this.team.transitionTask(id, "paused");
-		await this.publishCommitted();
-		try {
-			if (this.workers.has(`task:${id}`)) await this.workers.request(`task:${id}`, "abort", {});
-		} finally {
-			await this.scheduleTasks(task.projectId);
-		}
-		return taskView(task, this.rolesById.get(task.roleId) ?? task.roleId, this.taskDetails.get(id));
-	}
-
-	private async resumeTask(id: string): Promise<DesktopTask> {
-		const current = await this.requireTask(id);
-		const running = (await this.team.snapshot(current.projectId)).tasks.filter(
-			(task) => task.status === "running",
-		).length;
-		if (running >= 4)
-			throw new DesktopAppError("CONCURRENCY_LIMIT", "Four tasks are already running in this project");
-		const task = await this.team.transitionTask(id, "running");
-		await this.publishCommitted();
-		try {
-			if (this.workers.has(`task:${id}`))
-				await this.workers.request(`task:${id}`, "prompt", {
-					text: "Continue this task from the last settled step.",
-				});
-			else await this.startTask(task);
-		} catch (error) {
-			await this.workers.stop(`task:${id}`).catch((stopError: unknown) => {
-				this.emitDiagnostic("TASK_STOP_FAILED", stopError instanceof Error ? stopError.message : String(stopError));
-			});
-			await this.team.transitionTask(id, "failed");
+	private pauseTask(id: string): Promise<DesktopTask> {
+		return this.withTaskControl(id, async () => {
+			const task = await this.team.transitionTask(id, "paused");
 			await this.publishCommitted();
-			await this.scheduleTasks(task.projectId);
-			throw error;
-		}
-		return taskView(task, this.rolesById.get(task.roleId) ?? task.roleId, this.taskDetails.get(id));
+			try {
+				if (this.workers.has(`task:${id}`)) await this.workers.request(`task:${id}`, "abort", {});
+			} finally {
+				await this.scheduleTasks(task.projectId);
+			}
+			return taskView(task, this.rolesById.get(task.roleId) ?? task.roleId, this.taskDetails.get(id));
+		});
 	}
 
-	private async cancelTask(id: string): Promise<DesktopTask> {
-		const task = await this.team.transitionTask(id, "cancelled");
-		await this.publishCommitted();
-		try {
-			await this.workers.stop(`task:${id}`);
-		} finally {
-			await this.scheduleTasks(task.projectId);
-		}
-		return taskView(task, this.rolesById.get(task.roleId) ?? task.roleId, this.taskDetails.get(id));
+	private resumeTask(id: string): Promise<DesktopTask> {
+		return this.withTaskControl(id, async () => {
+			const current = await this.requireTask(id);
+			const running = (await this.team.snapshot(current.projectId)).tasks.filter(
+				(task) => task.status === "running",
+			).length;
+			if (running >= 4)
+				throw new DesktopAppError("CONCURRENCY_LIMIT", "Four tasks are already running in this project");
+			const task = await this.team.transitionTask(id, "running");
+			await this.publishCommitted();
+			try {
+				if (this.workers.has(`task:${id}`))
+					await this.promptTask(id, "Continue this task from the last settled step.");
+				else await this.startTask(task);
+			} catch (error) {
+				await this.workers.stop(`task:${id}`).catch((stopError: unknown) => {
+					this.emitDiagnostic(
+						"TASK_STOP_FAILED",
+						stopError instanceof Error ? stopError.message : String(stopError),
+					);
+				});
+				await this.team.transitionTask(id, "failed");
+				await this.publishCommitted();
+				await this.scheduleTasks(task.projectId);
+				throw error;
+			}
+			return taskView(task, this.rolesById.get(task.roleId) ?? task.roleId, this.taskDetails.get(id));
+		});
+	}
+
+	private cancelTask(id: string): Promise<DesktopTask> {
+		return this.withTaskControl(id, async () => {
+			const task = await this.team.transitionTask(id, "cancelled");
+			await this.publishCommitted();
+			try {
+				await this.workers.stop(`task:${id}`);
+			} finally {
+				await this.scheduleTasks(task.projectId);
+			}
+			return taskView(task, this.rolesById.get(task.roleId) ?? task.roleId, this.taskDetails.get(id));
+		});
 	}
 
 	private async mergeTask(id: string): Promise<{ merged: boolean; conflicts: string[] }> {
@@ -1535,8 +1595,8 @@ export class DesktopAppService {
 		})();
 	}
 
-	private async handleWorkerEvent(key: string, event: WorkerEvent["event"]): Promise<void> {
-		if (this.closing) return;
+	private async handleWorkerEvent(key: string, event: WorkerEvent["event"], generation: string): Promise<void> {
+		if (this.closing || this.workerGenerations.get(key) !== generation) return;
 		if (event.type === "mcp.status") {
 			const servers = mcpServerViews(event.servers);
 			this.mcpServersByWorker.set(key, servers);
@@ -1619,6 +1679,40 @@ export class DesktopAppService {
 			return;
 		}
 		if (event.type === "state") {
+			if (key.startsWith("task:") && (event.state === "idle" || event.state === "failed")) {
+				const id = key.slice(5);
+				await this.withTaskControl(id, async () => {
+					// Both the event and current task status must belong to this run. Pause,
+					// resume and settlement share the same queue so the check stays valid.
+					if (!event.runId || event.runId !== this.taskRunIds.get(id)) return;
+					const task = await this.team.getTask(id);
+					if (task?.status !== "running") return;
+					if (event.state === "idle") {
+						if (task.worktreePath && task.baseCommit) {
+							try {
+								this.taskDetail(id).changes = [
+									...(await inspectTaskWorktree({
+										worktreePath: task.worktreePath,
+										baseCommit: task.baseCommit,
+									})),
+								];
+							} catch (error) {
+								this.emitDiagnostic("TASK_DIFF_FAILED", error instanceof Error ? error.message : String(error));
+							}
+						}
+						await this.taskDetailStore.save(id, this.taskDetail(id));
+						await this.refreshTaskHistory(task);
+					}
+					const status =
+						event.state === "failed" ? "failed" : event.outcome === "completed" ? "completed" : "review";
+					await this.team.transitionTask(id, status);
+					this.taskRunIds.delete(id);
+					await this.publishCommitted();
+					await this.emitSnapshot();
+					await this.scheduleTasks(task.projectId);
+				});
+				return;
+			}
 			if (key.startsWith("session:")) {
 				const id = key.slice(8);
 				if (event.state === "streaming") await this.setSessionStatus(id, "running");
@@ -1626,43 +1720,14 @@ export class DesktopAppService {
 				if (event.state === "failed") await this.setSessionStatus(id, "error");
 				if (event.state === "streaming" || event.state === "idle" || event.state === "failed")
 					await this.emitSnapshot();
-			} else if (key.startsWith("task:") && event.state === "failed") {
-				const task = await this.team.getTask(key.slice(5));
-				if (task?.status === "running") {
-					await this.team.transitionTask(task.id, "failed");
-					await this.publishCommitted();
-					await this.scheduleTasks(task.projectId);
-				}
-			} else if (key.startsWith("task:") && event.state === "idle") {
-				const id = key.slice(5);
-				const task = await this.team.getTask(id);
-				if (task?.status === "running") {
-					if (task.worktreePath && task.baseCommit) {
-						try {
-							this.taskDetail(id).changes = [
-								...(await inspectTaskWorktree({
-									worktreePath: task.worktreePath,
-									baseCommit: task.baseCommit,
-								})),
-							];
-						} catch (error) {
-							this.emitDiagnostic("TASK_DIFF_FAILED", error instanceof Error ? error.message : String(error));
-						}
-					}
-					await this.taskDetailStore.save(id, this.taskDetail(id));
-					await this.refreshTaskHistory(task);
-					await this.team.transitionTask(id, "completed");
-					await this.publishCommitted();
-					await this.emitSnapshot();
-					await this.scheduleTasks(task.projectId);
-				}
 			}
 			return;
 		}
 		if (event.type === "ui.request") {
-			this.pendingUiRequests.add(`${key}:${event.requestId}`);
+			const id = `${key}:${generation}:${event.requestId}`;
+			this.pendingUiRequests.set(id, { key, requestId: event.requestId, generation });
 			const request = {
-				id: `${key}:${event.requestId}`,
+				id,
 				extensionId: key,
 				title: event.title,
 				message: event.message,
@@ -1735,7 +1800,7 @@ export class DesktopAppService {
 			return;
 		}
 		if (event.type === "ui.dismiss") {
-			const requestId = `${key}:${event.requestId}`;
+			const requestId = `${key}:${generation}:${event.requestId}`;
 			if (!this.pendingUiRequests.delete(requestId)) return;
 			await this.recordEvent("extension.dismiss", { requestId, reason: event.reason });
 		}
@@ -1808,13 +1873,21 @@ export class DesktopAppService {
 		}
 	}
 
-	private async handleWorkerExit(key: string, code: number): Promise<void> {
-		if (this.closing) return;
-		const requestPrefix = `${key}:`;
-		for (const requestId of this.pendingUiRequests) {
-			if (!requestId.startsWith(requestPrefix)) continue;
+	private handleWorkerExit(key: string, code: number, generation: string): Promise<void> {
+		return key.startsWith("task:")
+			? this.withTaskControl(key.slice(5), () => this.cleanupWorkerExit(key, code, generation))
+			: this.cleanupWorkerExit(key, code, generation);
+	}
+
+	private async cleanupWorkerExit(key: string, code: number, generation: string): Promise<void> {
+		if (this.closing || this.workerGenerations.get(key) !== generation) return;
+		await this.workerUiEventTail;
+		if (this.workerGenerations.get(key) !== generation) return;
+		for (const [requestId, pending] of [...this.pendingUiRequests]) {
+			if (pending.key !== key || pending.generation !== generation) continue;
 			await this.dismissPendingUiRequest(requestId);
 		}
+		if (this.workerGenerations.get(key) !== generation) return;
 		this.mcpServersByWorker.delete(key);
 		await this.recordEvent("mcp.status", { workerKey: key, servers: [] });
 		if (key.startsWith("session:")) {

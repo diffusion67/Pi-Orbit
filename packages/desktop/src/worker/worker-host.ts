@@ -74,6 +74,13 @@ type MainPending = {
 	readonly abortListener?: () => void;
 };
 
+type PromptRun = {
+	readonly id?: string;
+	abortRequested: boolean;
+	lastAssistant?: Extract<AgentMessage, { role: "assistant" }>;
+	completion?: Promise<void>;
+};
+
 const MAX_EVENT_TEXT = 20_000;
 const MAX_JSON_DEPTH = 5;
 const DESKTOP_EXTENSION_MODE: ExtensionMode = "desktop";
@@ -303,6 +310,7 @@ export class DesktopWorkerHost {
 	private shuttingDown = false;
 	private nextUiRequest = 0;
 	private extensionToolsExpanded = false;
+	private activeRun?: PromptRun;
 
 	constructor(port: DesktopWorkerPort, options: DesktopWorkerHostOptions = {}) {
 		this.port = port;
@@ -418,7 +426,12 @@ export class DesktopWorkerHost {
 		}
 		if (request.type === "abort") {
 			if (!this.runtime) return this.reject(request.id, "NOT_INITIALIZED", "Worker is not initialized");
+			const run = this.activeRun;
+			if (run) run.abortRequested = true;
 			await this.runtime.session.abort();
+			// Settlement is emitted before prompt() resolves. Finish its terminal event before
+			// acknowledging abort, so the next prompt cannot overlap the previous run.
+			await run?.completion;
 			this.respond(request.id, { aborted: true });
 			return;
 		}
@@ -478,28 +491,34 @@ export class DesktopWorkerHost {
 		const runtime = this.runtime!;
 		switch (request.type) {
 			case "prompt": {
-				if (runtime.session.isStreaming)
+				if (runtime.session.isStreaming || this.activeRun)
 					return this.reject(request.id, "OPERATION_FAILED", "Session is already streaming");
 				validateSessionInput(request.payload.text, request.payload.attachments);
 				const text = appendTextAttachments(request.payload.text, request.payload.attachments);
 				const images = imageContentFromAttachments(request.payload.attachments);
+				const run: PromptRun = { id: request.payload.runId, abortRequested: false };
+				this.activeRun = run;
 				this.respond(request.id, { accepted: true });
 				this.emit({
 					type: "event",
-					event: { type: "state", state: "streaming", sessionId: runtime.session.sessionId },
+					event: {
+						type: "state",
+						state: "streaming",
+						sessionId: runtime.session.sessionId,
+						...(run.id ? { runId: run.id } : {}),
+					},
 				});
-				void runtime.session
+				run.completion = runtime.session
 					.prompt(text, {
 						source: "rpc",
 						...(images.length === 0 ? {} : { images }),
 					})
-					.catch((error: unknown) => {
-						const message = redactText(errorMessage(error));
-						this.emit({
-							type: "event",
-							event: { type: "state", state: "failed", sessionId: runtime.session.sessionId, message },
-						});
-						this.emit({ type: "event", event: { type: "diagnostic", level: "error", message } });
+					.then(
+						() => this.publishRunOutcome(run),
+						(error: unknown) => this.publishRunOutcome(run, errorMessage(error)),
+					)
+					.finally(() => {
+						if (this.activeRun === run) this.activeRun = undefined;
 					});
 				return;
 			}
@@ -507,6 +526,7 @@ export class DesktopWorkerHost {
 				validateSessionInput(request.payload.text, request.payload.attachments);
 				const text = appendTextAttachments(request.payload.text, request.payload.attachments);
 				const images = imageContentFromAttachments(request.payload.attachments);
+				const runId = this.activeRun?.id;
 				this.respond(request.id, { accepted: true, delivery: request.payload.deliverAs });
 				void runtime.session
 					.prompt(text, {
@@ -518,7 +538,13 @@ export class DesktopWorkerHost {
 						const message = redactText(errorMessage(error));
 						this.emit({
 							type: "event",
-							event: { type: "state", state: "failed", sessionId: runtime.session.sessionId, message },
+							event: {
+								type: "state",
+								state: "failed",
+								sessionId: runtime.session.sessionId,
+								message,
+								...(runId ? { runId } : {}),
+							},
 						});
 						this.emit({ type: "event", event: { type: "diagnostic", level: "error", message } });
 					});
@@ -815,13 +841,41 @@ export class DesktopWorkerHost {
 		});
 	}
 
+	private publishRunOutcome(run: PromptRun, error?: string): void {
+		if (this.shuttingDown) return;
+		const base = {
+			type: "state" as const,
+			sessionId: this.runtime?.session.sessionId,
+			...(run.id ? { runId: run.id } : {}),
+		};
+		if (run.abortRequested || run.lastAssistant?.stopReason === "aborted") {
+			this.emit({ type: "event", event: { ...base, state: "idle", outcome: "aborted" } });
+		} else if (error !== undefined || run.lastAssistant?.stopReason === "error") {
+			const message = redactText(error ?? run.lastAssistant?.errorMessage ?? "Model request failed");
+			this.emit({ type: "event", event: { ...base, state: "failed", message } });
+			this.emit({ type: "event", event: { type: "diagnostic", level: "error", message } });
+		} else {
+			this.emit({ type: "event", event: { ...base, state: "idle", outcome: "completed" } });
+		}
+	}
+
 	private publishSessionEvent(event: AgentSessionEvent): void {
+		if (event.type === "message_end" && event.message.role === "assistant" && this.activeRun)
+			this.activeRun.lastAssistant = event.message;
 		if (event.type === "agent_start") {
 			this.emit({
 				type: "event",
-				event: { type: "state", state: "streaming", sessionId: this.runtime?.session.sessionId },
+				event: {
+					type: "state",
+					state: "streaming",
+					sessionId: this.runtime?.session.sessionId,
+					...(this.activeRun?.id ? { runId: this.activeRun.id } : {}),
+				},
 			});
 		} else if (event.type === "agent_settled") {
+			// A settled run may still reject (and model errors normally resolve). The owning
+			// prompt publishes exactly one outcome once both its events and promise finish.
+			if (this.activeRun) return;
 			this.emit({
 				type: "event",
 				event: { type: "state", state: "idle", sessionId: this.runtime?.session.sessionId },

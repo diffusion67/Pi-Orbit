@@ -217,6 +217,58 @@ describe("Session protocol", () => {
 		await expect(second.attach(serverId, "session-1")).resolves.toMatchObject({ ok: true });
 	});
 
+	test.each(["disconnect", "shutdown"] as const)(
+		"isolates synchronous server-service release failures during %s",
+		async (operation) => {
+			const backing = new TestServerHost();
+			await Promise.all([backing.seed("session-1"), backing.seed("session-2")]);
+			const releaseError = new Error("server service release failed");
+			const errors: Error[] = [];
+			let releaseCount = 0;
+			const serviceHost = createTestServerServices();
+			const host: ServerHost = {
+				resolveSession: (sessionId, context) => backing.resolveSession(sessionId, context),
+				openSession: (metadata, context) => backing.openSession(metadata, context),
+				serverServices: {
+					async attachClient(presentation, context) {
+						const attachment = await serviceHost.attachClient(presentation, context);
+						return {
+							...attachment,
+							release() {
+								releaseCount += 1;
+								throw releaseError;
+							},
+						};
+					},
+				},
+			};
+			const server = new Server(host, { listeners: [], serverId, onError: (error) => errors.push(error) });
+			const first = connect(server);
+			const second = connect(server);
+			await Promise.all([first.hello(), second.hello()]);
+			await first.attach(serverId, "session-1");
+			await second.attach(serverId, "session-2");
+			const harnesses = [backing.latestHarness("session-1"), backing.latestHarness("session-2")];
+			try {
+				if (operation === "disconnect") {
+					await expect(first.close()).resolves.toBeUndefined();
+					await expect.poll(() => errors).toEqual([releaseError]);
+					expect(harnesses[0]!.attachedClients).toBe(0);
+					expect(harnesses[1]!.attachedClients).toBe(1);
+				}
+				await expect(server.close()).resolves.toBeUndefined();
+				await expect(server.closed).resolves.toBeUndefined();
+				await expect.poll(() => errors).toEqual([releaseError, releaseError]);
+				expect(releaseCount).toBe(2);
+				expect(harnesses.map((harness) => harness.attachmentReleaseCount)).toEqual([1, 1]);
+				expect(harnesses.map((harness) => harness.closeCount)).toEqual([1, 1]);
+			} finally {
+				await server.close().catch(() => {});
+				await Promise.all(harnesses.map((harness) => harness.close(BACKGROUND_CONTEXT)));
+			}
+		},
+	);
+
 	test("requires the requesting client to hold the targeted Session attachment", async () => {
 		const host = new TestServerHost();
 		await Promise.all([host.seed("session-1"), host.seed("session-2")]);

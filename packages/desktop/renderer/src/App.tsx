@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState, type ChangeEvent, type FormEvent } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -8,6 +8,8 @@ import { AttachmentBudget, MAX_ATTACHMENT_BYTES } from "../../src/shared/attachm
 import { McpPanel } from "./McpPanel";
 import { SessionComposer, filterProjectSessions, shouldSendKey } from "../../src/shared/session-composer.ts";
 import { appendTerminalOutput, terminalOutputDelta } from "../../src/shared/terminal-output.ts";
+import { extensionRequestQueue } from "./extension-request-queue.ts";
+import { canResumeTask } from "./task-controls.ts";
 
 type CatalogKind = "skills" | "templates" | "commands" | "extensions";
 type Modal = "settings" | "roles" | "catalog" | "mcp" | "new-task" | "open-project" | "terminal" | null;
@@ -75,7 +77,8 @@ function App() {
 	const [renaming, setRenaming] = useState(false);
 	const [sessionDelivery, setSessionDelivery] = useState<"steer" | "followUp">("steer");
 	const [projectPath, setProjectPath] = useState("");
-	const [eventRequest, setEventRequest] = useState<Extract<DesktopEvent, { type: "extension.request" }> | null>(null);
+	const [eventRequests, dispatchExtensionRequest] = useReducer(extensionRequestQueue, []);
+	const eventRequest = eventRequests[0];
 	const [authFlow, setAuthFlow] = useState<AuthFlowEvent | null>(null);
 	const [mcpAuthEvent, setMcpAuthEvent] = useState<McpAuthEvent>();
 	const transcriptRef = useRef<HTMLDivElement>(null);
@@ -115,8 +118,7 @@ function App() {
 		if (event.seq <= lastEventSeq.current) return;
 		lastEventSeq.current = event.seq;
 		if (event.type === "diagnostic") setError(`${event.code}: ${event.message}`);
-		if (event.type === "extension.request") setEventRequest(event);
-		if (event.type === "extension.dismiss") setEventRequest((current) => current?.request.id === event.requestId ? null : current);
+		if (event.type === "extension.request" || event.type === "extension.dismiss") dispatchExtensionRequest(event);
 		setSnapshot((current) => {
 			if (event.seq <= current.lastEventSeq) return current;
 			if (event.type === "snapshot") return event.snapshot;
@@ -191,9 +193,7 @@ function App() {
 	}, []);
 	const respondExtensionDialog = (requestId: string, value: unknown) => {
 		void call("extension.ui.respond", { requestId, value }).then((result) => {
-			if (result.ok || result.code === "UI_REQUEST_NOT_FOUND" || result.code === "WORKER_NOT_RUNNING") {
-				setEventRequest((current) => current?.request.id === requestId ? null : current);
-			}
+			dispatchExtensionRequest({ type: "extension.response", requestId, result });
 		});
 	};
 
@@ -375,7 +375,7 @@ function App() {
 			<aside className="sidebar right-sidebar" aria-label={t("Task and file details")}>
 				<div className="inspector-head"><div><span className="eyebrow">{t("ORCHESTRATION")}</span><h2>{t("Tasks")} <span className="task-count">{projectTasks.length}</span></h2></div><button className="tiny-icon" aria-label={t("Create task")} disabled={!activeProject} onClick={() => setModal("new-task")}>＋</button></div>
 				<div className="task-list" aria-label={t("Task list")}>{projectTasks.length === 0 ? <div className="task-empty"><div className="task-empty-icon">⑂</div><b>{t("No delegated tasks")}</b><p>{t("Delegate focused work to a role. Each task gets an isolated worktree and its own conversation.")}</p><button className="outline-button" disabled={!activeProject} onClick={() => setModal("new-task")}>{t("Create task")}</button></div> : projectTasks.map((task) => <button key={task.id} className={`task-card ${task.id === (activeTask?.id) ? "task-selected" : ""}`} onClick={() => { setSelectedTaskId(task.id); setSelectedFile(null); }}><div className="task-card-top"><span className={`task-status status-${task.status}`}>{statusLabel(task.status, t)}</span><span className="task-time">{relativeTime(task.updatedAt, languagePreview)}</span></div><b>{task.prompt}</b><div className="task-card-meta"><span className="task-avatar">{task.roleName.slice(0, 1).toUpperCase()}</span>{task.roleName}<span className="meta-sep">·</span>{task.filesChanged} {t("files")}</div>{task.dependsOn.length > 0 && <div className="dependency-line">↳ {t(" waits for ")}{task.dependsOn.map((id) => snapshot.tasks.find((candidate) => candidate.id === id)?.roleName ?? id.slice(0, 7)).join(", ")}</div>}</button>)}</div>
-				{activeTask && <div className="task-detail"><div className="detail-title-row"><div><span className={`task-status status-${activeTask.status}`}>{statusLabel(activeTask.status, t)}</span><h3>{activeTask.roleName}</h3></div><button className="tiny-icon" aria-label={t("Task actions")} onClick={() => setSelectedFile(null)}>•••</button></div><p className="task-prompt">{activeTask.prompt}</p>{activeTask.resultSummary && <div className="task-result"><div className="detail-label">{t("LATEST RESULT")}</div><p>{activeTask.resultSummary}</p></div>}<ExtensionUiPanel state={snapshot.extensionUi[`task:${activeTask.id}`]} t={t} onUseEditorText={(text) => setDraft(text)} /><div className="task-actions">{activeTask.status === "running" && <button onClick={() => void call("task.pause", { taskId: activeTask.id })}>Ⅱ {t("Pause")}</button>}{activeTask.status === "paused" && <button onClick={() => void call("task.resume", { taskId: activeTask.id })}>▶ {t("Resume")}</button>}{!["merged", "cancelled", "failed", "completed"].includes(activeTask.status) && <button className="danger-action" onClick={() => void call("task.cancel", { taskId: activeTask.id })}>{t("Cancel")}</button>}{["review", "completed"].includes(activeTask.status) && <button className="merge-button" onClick={() => void mergeTask(activeTask.id)}>{t("Merge changes")}</button>}</div>{activeTask.usage && <div className="task-usage"><span>{t("Usage")}</span><span>{t("In")} {activeTask.usage.input.toLocaleString()}</span><span>{t("Out")} {activeTask.usage.output.toLocaleString()}</span></div>}
+				{activeTask && <div className="task-detail"><div className="detail-title-row"><div><span className={`task-status status-${activeTask.status}`}>{statusLabel(activeTask.status, t)}</span><h3>{activeTask.roleName}</h3></div><button className="tiny-icon" aria-label={t("Task actions")} onClick={() => setSelectedFile(null)}>•••</button></div><p className="task-prompt">{activeTask.prompt}</p>{activeTask.resultSummary && <div className="task-result"><div className="detail-label">{t("LATEST RESULT")}</div><p>{activeTask.resultSummary}</p></div>}<ExtensionUiPanel state={snapshot.extensionUi[`task:${activeTask.id}`]} t={t} onUseEditorText={(text) => setDraft(text)} /><div className="task-actions">{activeTask.status === "running" && <button onClick={() => void call("task.pause", { taskId: activeTask.id })}>Ⅱ {t("Pause")}</button>}{canResumeTask(activeTask.status) && <button onClick={() => void call("task.resume", { taskId: activeTask.id })}>▶ {t("Resume")}</button>}{!["merged", "cancelled", "failed", "completed"].includes(activeTask.status) && <button className="danger-action" onClick={() => void call("task.cancel", { taskId: activeTask.id })}>{t("Cancel")}</button>}{["review", "completed"].includes(activeTask.status) && <button className="merge-button" onClick={() => void mergeTask(activeTask.id)}>{t("Merge changes")}</button>}</div>{activeTask.usage && <div className="task-usage"><span>{t("Usage")}</span><span>{t("In")} {activeTask.usage.input.toLocaleString()}</span><span>{t("Out")} {activeTask.usage.output.toLocaleString()}</span></div>}
 					<div className="detail-tabs"><span>{t("Changes")} <b>{activeTask.changes.length}</b></span><span>{t("Activity")} <b>{activeTask.messages.length + activeTask.toolRecords.length}</b></span></div>
 					<div className="change-list">{activeTask.changes.length ? activeTask.changes.map((change) => <button key={change.path} className={`change-row ${selectedFile === change.path ? "file-selected" : ""}`} onClick={() => setSelectedFile(selectedFile === change.path ? null : change.path)}><span className={`file-dot file-${change.status}`} />{change.path}<span className="change-kind">{change.status === "modified" ? "M" : change.status === "added" ? "A" : "D"}</span></button>) : <p className="empty-hint">{t("No changed files yet.")}</p>}{selectedFile && activeTask.changes.find((change) => change.path === selectedFile) && <pre className="diff-preview">{activeTask.changes.find((change) => change.path === selectedFile)?.diff || t("No diff content was provided.")}</pre>}</div>
 					<div className="task-messages"><div className="detail-label">{t("TASK MESSAGES")}</div>{activeTask.messages.length > 0 ? activeTask.messages.slice(-3).map((message) => <div key={message.id} className="task-message"><b>{message.author}</b><p>{message.text}</p></div>) : <p className="empty-hint">{t("No task messages yet.")}</p>}</div>

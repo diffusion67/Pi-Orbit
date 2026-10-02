@@ -1,6 +1,6 @@
-import { access, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createEditTool } from "../src/core/tools/edit.ts";
 import { withFileMutationQueue } from "../src/core/tools/file-mutation-queue.ts";
@@ -95,6 +95,69 @@ describe("withFileMutationQueue", () => {
 		]);
 
 		expect(order).toEqual(["target:start", "target:end", "alias:start", "alias:end"]);
+	});
+
+	// PR #5 review: missing targets must share a canonical key before the first write creates them.
+	it.each(["new.txt", "missing/nested/new.txt"])("serializes missing-file aliases for %s", async (relativePath) => {
+		const dir = await createTempDir();
+		const realDir = join(dir, "real");
+		const aliasDir = join(dir, "alias");
+		await mkdir(realDir);
+		await symlink(realDir, aliasDir, process.platform === "win32" ? "junction" : "dir");
+		const targetPath = join(realDir, relativePath);
+		const aliasPath = join(aliasDir, relativePath);
+		const firstStarted = createDeferred();
+		const finishFirst = createDeferred();
+		const first = withFileMutationQueue(aliasPath, async () => {
+			firstStarted.resolve();
+			await finishFirst.promise;
+			await mkdir(dirname(aliasPath), { recursive: true });
+			await writeFile(aliasPath, "first\n");
+		});
+		await firstStarted.promise;
+		let secondStarted = false;
+		const second = withFileMutationQueue(targetPath, async () => {
+			secondStarted = true;
+			await mkdir(dirname(targetPath), { recursive: true });
+			await writeFile(targetPath, "second\n");
+		});
+		// A different file waits for key registration, but not for either mutation to finish.
+		await withFileMutationQueue(join(dir, "registration-barrier"), async () => {});
+		const overlapped = secondStarted;
+		finishFirst.resolve();
+		await Promise.all([first, second]);
+
+		expect(overlapped).toBe(false);
+		expect(await readFile(targetPath, "utf8")).toBe("second\n");
+	});
+
+	it("keeps the same alias key after a missing file is created", async () => {
+		const dir = await createTempDir();
+		const realDir = join(dir, "real");
+		const aliasDir = join(dir, "alias");
+		await mkdir(realDir);
+		await symlink(realDir, aliasDir, process.platform === "win32" ? "junction" : "dir");
+		const aliasPath = join(aliasDir, "new.txt");
+		const created = createDeferred();
+		const finishFirst = createDeferred();
+		const first = withFileMutationQueue(aliasPath, async () => {
+			await writeFile(aliasPath, "first\n");
+			created.resolve();
+			await finishFirst.promise;
+		});
+		await created.promise;
+		let secondStarted = false;
+		const second = withFileMutationQueue(aliasPath, async () => {
+			secondStarted = true;
+			await writeFile(aliasPath, "second\n");
+		});
+		await withFileMutationQueue(join(dir, "registration-barrier"), async () => {});
+		const overlapped = secondStarted;
+		finishFirst.resolve();
+		await Promise.all([first, second]);
+
+		expect(overlapped).toBe(false);
+		expect(await readFile(aliasPath, "utf8")).toBe("second\n");
 	});
 });
 

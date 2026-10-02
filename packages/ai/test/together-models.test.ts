@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { getModel } from "../src/compat.ts";
+import { streamSimple } from "../src/api/openai-completions.ts";
+import { getModel, getSupportedThinkingLevels, normalizeContext } from "../src/compat.ts";
 import { findEnvKeys, getEnvApiKey } from "../src/env-api-keys.ts";
 
 const originalTogetherApiKey = process.env.TOGETHER_API_KEY;
@@ -58,23 +59,55 @@ describe("Together models", () => {
 			thinkingFormat: "openai",
 		});
 
-		const deepSeekV4 = getModel("together", "deepseek-ai/DeepSeek-V4-Pro");
+		const minimax = getModel("together", "MiniMaxAI/MiniMax-M2.7");
+		expect(minimax.thinkingLevelMap).toEqual({ off: null, minimal: null, low: null, medium: null });
+		expect(minimax.compat?.thinkingFormat).toBeUndefined();
+		expect(minimax.compat?.supportsReasoningEffort).toBe(false);
+	});
+
+	it("supports documented reasoning controls for the current DeepSeek V4 Pro revision", () => {
+		const deepSeekV4 = getModel("together", "deepseek-ai/DeepSeek-V4-Pro-0813");
+		expect(deepSeekV4).toBeDefined();
 		expect(deepSeekV4.thinkingLevelMap).toEqual({
 			minimal: null,
 			low: null,
 			medium: null,
 			high: "high",
 			xhigh: null,
+			max: "max",
 		});
 		expect(deepSeekV4.compat).toMatchObject({
 			supportsReasoningEffort: true,
 			thinkingFormat: "together",
 		});
+		expect(getSupportedThinkingLevels(deepSeekV4)).toEqual(["off", "high", "max"]);
+	});
 
-		const minimax = getModel("together", "MiniMaxAI/MiniMax-M2.7");
-		expect(minimax.thinkingLevelMap).toEqual({ off: null, minimal: null, low: null, medium: null });
-		expect(minimax.compat?.thinkingFormat).toBeUndefined();
-		expect(minimax.compat?.supportsReasoningEffort).toBe(false);
+	it.each(["off", "high", "max"] as const)("sends the DeepSeek V4 Pro %s reasoning control", async (reasoning) => {
+		const model = getModel("together", "deepseek-ai/DeepSeek-V4-Pro-0813");
+		const context = normalizeContext({
+			messages: [{ role: "user", content: "Hello", timestamp: 0 }],
+		});
+		let payload: unknown;
+
+		await streamSimple(model, context, {
+			apiKey: "test-together-key",
+			reasoning: reasoning === "off" ? undefined : reasoning,
+			onPayload: (request) => {
+				payload = request;
+				throw new Error("payload captured");
+			},
+		}).result();
+
+		expect(payload).toMatchObject({
+			model: "deepseek-ai/DeepSeek-V4-Pro-0813",
+			reasoning: { enabled: reasoning !== "off" },
+		});
+		if (reasoning === "off") {
+			expect(payload).not.toHaveProperty("reasoning_effort");
+		} else {
+			expect(payload).toHaveProperty("reasoning_effort", reasoning);
+		}
 	});
 
 	it("resolves TOGETHER_API_KEY from the environment", () => {

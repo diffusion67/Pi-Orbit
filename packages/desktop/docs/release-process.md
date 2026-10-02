@@ -4,7 +4,9 @@
 each platform: an NSIS installer on Windows, a DMG on macOS, and an AppImage on
 Linux. Artifacts are attached to the workflow run for 14 days. The workflow
 is triggered by changes to relevant paths on `main`, pull requests, or manual
-dispatch. It does not create a Git tag or publish a GitHub Release. The separate
+dispatch. The artifact-building workflow does not create a Git tag or publish a GitHub Release.
+The dedicated `.github/workflows/desktop-publish-release.yml` can publish the
+explicitly approved unsigned `0.1.0-rc.1` prerelease after the gates below pass. The separate
 manual `.github/workflows/desktop-signed-candidate.yml` signs Windows and macOS
 artifacts from reviewed `main` after the protected `desktop-signing` environment
 approves access to its secrets.
@@ -46,33 +48,81 @@ durable running task to review without repeating its request. These remaining
 product flows stay listed in [acceptance.md](./acceptance.md) and must not be
 claimed as verified by this workflow.
 
-On 2026-09-26, the previous desktop revision at `060f857` passed a local
-Windows x64 NSIS package smoke:
-`test/smoke/windows-installed.ps1`: silent installation, packaged-app launch,
-disposable credential and settings configuration, native terminal I/O,
-local faux-provider chat,
-subtask interruption and recovery, clean exit, and silent uninstall. The local
-build used `electron-builder --win nsis --config.npmRebuild=false`. Its installer
-is unsigned. The subsequent
-[three-platform workflow run](https://github.com/diffusion67/Pi-Orbit/actions/runs/36235546240)
-packaged Windows, macOS, and Linux artifacts. Windows installed-app smoke
-passed; macOS failed while starting its
-terminal (`posix_spawnp failed`), and Linux failed to connect to the Xvfb
-display. Local fixes for those two failures have not yet passed their native CI
-smokes. On 2026-10-01, the desktop based on Pi commit `8ce69e9` passed the local unsigned Windows
-x64 NSIS installed-artifact smoke, including installation, authentication,
-terminal I/O, faux-provider chat, task recovery, and uninstall. The macOS and
-Linux fixes have not passed a native installed-artifact smoke for this sync.
-The later sync to `0f8740bb6` passed desktop source and integration tests, but
-has not been packaged or verified as an installed artifact.
+The [2026-10-01 three-platform workflow run](https://github.com/diffusion67/Pi-Orbit/actions/runs/36880990428)
+passed the unsigned installed-artifact smokes for source commit
+`90699497275bfb440abb9d73046a57c793cfc8af`. Those results are historical evidence,
+not approval to publish a newer source. The `7fbbd5f4` upstream sync and desktop
+`0.1.0-rc.1` must pass fresh full CI and all three native jobs at the exact same
+current `main` SHA before publication.
+
+## Approved unsigned prerelease publication
+
+This is a bounded exception for `diffusion67/Pi-Orbit`, desktop version
+`0.1.0-rc.1`, tag `pi-orbit-v0.1.0-rc.1`. The tag intentionally does not match the
+upstream `v*` npm/binary publication pipeline. It publishes no npm packages,
+R2 objects, website version markers, signing credentials or automatic updates.
+Another version or broader publication behavior requires a separate review.
+
+The publisher starts only when either `CI` or `Pi Orbit Desktop Unsigned
+Artifacts` completes successfully for a trusted `push` on this repository's
+`main`. It has no dispatch or PR trigger and rejects fork/PR provenance again
+in code. Workflow-level permissions are empty; only its publication job gets
+`contents: write` and `actions: read`. Checkout is SHA-pinned with credentials
+not persisted, and no dependency installation or artifact code execution is
+performed. Concurrency serializes publication for this one tag without
+cancelling an in-flight publisher.
+
+Before writing to GitHub, `scripts/desktop-release-publish.mjs` verifies:
+
+1. The checked-out desktop version and SHA, the trigger, and the live `main`
+   SHA match. Both workflows' latest main-push runs, including the current run
+   attempts, must be completed and successful. A newer pending or failed run
+   blocks an older successful run.
+2. Full build/check/test and MCP conformance jobs exist and passed. All three
+   desktop jobs and their mandatory typecheck, tests, build, package,
+   installed-smoke, checksum and upload steps exist and passed.
+3. Each platform artifact uniquely belongs to that desktop run, repository
+   and SHA, is unexpired, and was created during its validated job. The
+   matching job's single electron-builder packaging line supplies the actual
+   OS and architecture. Unknown or ambiguous architecture stops publication.
+4. Downloaded archives have exactly one versioned installer and `SHA256SUMS`.
+   Only safe flat filenames are accepted. Installer bytes are copied with
+   `unzip -p`, never executed or extracted as paths/symlinks. Archive digests,
+   when supplied by GitHub, and every installer checksum are verified. PE,
+   UDIF DMG or AppImage signatures are checked; AppImage architecture must
+   also agree with the build log.
+
+The script creates a new **draft prerelease** targeting that exact source SHA,
+uploads three installers, combined `SHA256SUMS`, and generated
+`RELEASE_NOTES.md` to that release ID, then downloads every asset to verify
+size and SHA-256. Installer release filenames replace spaces with hyphens to
+avoid GitHub's filename sanitization; source archive checksums still use the
+original names, while release notes and combined checksums use release names.
+It rechecks the latest runs and live main before publishing;
+main is checked again immediately before the publication request. The draft
+may not have a Git tag yet, but any tag that exists must point to the validated
+SHA. After publishing, all assets are downloaded and checked again, and the
+tag must exist at that SHA. No release is marked as Latest.
+
+No existing tag, release or asset is overwritten. An existing draft or tag
+without a matching published release stops the job for manual inspection.
+A second completion event can only read and verify an already-published
+release with identical source, notes and assets, then exit without writes.
+Failures never delete drafts or assets automatically. If a failure occurs,
+inspect the retained draft, job logs and source before deciding on a new
+version or a separately authorized recovery; do not blindly rerun publication
+or delete evidence.
 
 ## Signing and notarization
 
 The three-platform push/PR workflow always builds unsigned artifacts and never
-receives signing or notarization secrets. These artifacts check packaging and
-installed behavior, but are not public release candidates. Public Windows and
-macOS distribution requires signed artifacts; macOS additionally requires
-notarization and a stapled ticket.
+receives signing or notarization secrets. The approved `0.1.0-rc.1` prerelease
+explicitly distributes these unsigned artifacts and must disclose that
+Windows SmartScreen or macOS Gatekeeper can warn or block installation. It
+does not claim a verified publisher identity or Apple notarization. For a
+future signed distribution, use the separate signing workflow below; macOS
+also needs notarization and a stapled ticket. Signing is not silently enabled
+by the unsigned publisher.
 
 Before running the signed workflow, create a GitHub Actions environment named
 `desktop-signing`. Restrict its deployment branches to `main` and require a
@@ -106,7 +156,8 @@ job then checks the installer signature on Windows and the Developer ID
 signature, stapled ticket, and Gatekeeper assessment of the app from the DMG
 on macOS. It runs the installed-app smokes again and writes SHA-256 manifests.
 Any missing secret, invalid signature, or failed notarization stops the job.
-The native signed workflow must pass before a public candidate is claimed.
+The native signed workflow must pass before any candidate is described as
+signed and notarized.
 
 ## Release notes and checksums
 
@@ -117,5 +168,15 @@ notarization results, and the SHA-256 values from `SHA256SUMS`. Verify every
 checksum after downloading the workflow artifacts. Do not reuse notes or
 checksums from another run or commit.
 
-Both workflows stop at downloadable workflow artifacts. Publishing to GitHub
-remains a separate action that requires explicit user authorization.
+Both candidate-build workflows stop at downloadable workflow artifacts.
+The dedicated publisher is the separately authorized path for this one
+unsigned prerelease. Its Chinese notes template is
+[`releases/0.1.0-rc.1.md`](./releases/0.1.0-rc.1.md); source SHA, workflow links,
+verified architecture, asset sizes and hashes are injected from the validated
+run. Template placeholders must never be copied directly into a release.
+
+Run the publication safety regressions locally with:
+
+```sh
+node --test scripts/desktop-release.test.mjs
+```
