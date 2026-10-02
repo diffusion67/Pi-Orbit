@@ -1,0 +1,46 @@
+name: Pi Orbit Desktop Publish Prerelease
+
+on:
+  workflow_run:
+    workflows: ["CI", "Pi Orbit Desktop Unsigned Artifacts"]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+# Both prerequisite completions can arrive together. Never cancel a job after
+# draft creation, and never run two publishers for the single approved tag.
+concurrency:
+  group: pi-orbit-publish-0.1.0-rc.1
+  cancel-in-progress: false
+
+jobs:
+  publish-verified-prerelease:
+    if: >-
+      github.repository == 'diffusion67/Pi-Orbit' &&
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == 'diffusion67/Pi-Orbit' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout the completed main source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+
+      - name: Test publication safety guards
+        run: node --test scripts/desktop-release.test.mjs
+
+      - name: Verify both main runs and publish the unsigned prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_HOST: github.com
+          GH_PROMPT_DISABLED: "1"
+        run: node scripts/desktop-release-publish.mjs

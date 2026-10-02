@@ -21,9 +21,15 @@ subagent example. It is the release gate, not a promise that a control exists.
 | Teams | Role editing, DAG and concurrency, message/pause/resume/cancel/wait, full task history/usage | `packages/coding-agent/examples/extensions/subagent`, `packages/desktop/docs/architecture.md` | unverified |
 | Git | Clean HEAD worktree, diff review, conflict/delete protection, idempotent uncommitted merge | `packages/desktop/docs/architecture.md` | unverified |
 | Recovery | Persist before notification, replay by sequence, interrupted work enters review | `packages/desktop/docs/architecture.md` | unverified |
-| Windows | Signed NSIS install, launch, auth, chat, task, recovery, uninstall | Local unsigned NSIS smoke based on Pi commit `8ce69e9` passed on 2026-10-01; the later `0f8740bb6` sync, signing, and full UI acceptance need installed-artifact verification | partial |
-| macOS | Signed and notarized DMG install, launch, auth, chat, task, recovery, uninstall | CI built the DMG and launched the copied app; smoke failed at terminal start (`posix_spawnp failed`). A local fix awaits native CI verification; signing, notarization, and full UI acceptance remain | partial |
-| Linux | AppImage install, launch, auth, chat, task, recovery, uninstall | CI built the AppImage; smoke could not connect to Xvfb after `XAUTHORITY` was cleared. A local fix awaits native CI verification and full UI acceptance remains | partial |
+| Windows | NSIS install, launch, auth, chat, task, recovery, uninstall | Unsigned native smoke passed at `906994972` on 2026-10-01; real-provider auth, signing, and full UI acceptance remain unverified | partial |
+| macOS | DMG install, launch, auth, chat, task, recovery, uninstall | Unsigned native smoke passed at `906994972` on 2026-10-01; real-provider auth, signing/notarization, and full UI acceptance remain unverified | partial |
+| Linux | AppImage install, launch, auth, chat, task, recovery, uninstall | Native smoke passed at `906994972` on 2026-10-01; real-provider auth and full UI acceptance remain unverified | partial |
+
+The three platform results above come from
+[this native workflow run](https://github.com/diffusion67/Pi-Orbit/actions/runs/36880990428).
+They do not qualify a later commit for release. The unsigned prerelease path
+requires successful full CI and all three installed-app smokes for the exact
+released commit; signing and notarization are disclosed separately.
 
 Every in-repo extension must also be classified and exercised individually.
 Examples using TUI `custom`, raw terminal input, custom header/footer/editor,

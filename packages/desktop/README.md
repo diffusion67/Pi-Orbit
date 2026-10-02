@@ -96,12 +96,15 @@ its prompts. On macOS, mount the DMG and copy Pi Orbit to Applications. On
 Linux, make the AppImage executable and launch it. These are packaging targets;
 they do not imply that each platform has passed installed-app validation.
 
-The Windows x64 unsigned NSIS installer based on Pi commit `8ce69e9` passed a local
-installed-app smoke on 2026-10-01, including installation, launch, native
-terminal I/O, local faux provider chat, task interruption and recovery, and
-uninstall. The later sync to `0f8740bb6`, macOS, and Linux installed builds have not been verified. Windows
-packages are unsigned. Public Windows distribution requires code signing;
-macOS distribution requires code signing and notarization. See the
+The desktop at commit `906994972` passed native Windows, macOS, and Linux
+packaging and installed-app smoke checks on 2026-10-01
+([verified run](https://github.com/diffusion67/Pi-Orbit/actions/runs/36880990428)),
+including launch, native terminal I/O, local faux-provider chat, task
+interruption and recovery, and platform-specific installation/cleanup.
+Every new release must pass these checks again for its exact source commit.
+Unsigned prereleases are supported; Windows publisher warnings and macOS
+Gatekeeper restrictions may apply. Release notes state actual architectures,
+signing/notarization status, and checksums. See the
 [release process](./docs/release-process.md).
 
 ## Preferences and data
