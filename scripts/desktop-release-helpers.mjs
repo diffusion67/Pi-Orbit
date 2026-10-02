@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { stripVTControlCharacters } from "node:util";
 
 // Deliberately one release, one repository. Extending this is a separate release review.
 export const REPOSITORY = "diffusion67/Pi-Orbit";
@@ -26,6 +27,11 @@ export const PLATFORMS = {
 		smokeStep: "Launch packaged AppImage (Linux)",
 	},
 };
+
+export function getGitHubApiArgs(endpoint, { rawOutput = false } = {}) {
+	return ["api", endpoint, "-H", "X-GitHub-Api-Version: 2022-11-28", "-H", "Cache-Control: no-cache",
+		...(rawOutput ? ["--allow-escape-sequences"] : [])];
+}
 
 export function assertTrustedRun(run, workflow, sha) {
 	assert.ok(/^[a-f0-9]{40}$/.test(sha), "Invalid source SHA");
@@ -152,7 +158,7 @@ export function verifyInstallerChecksum(manifest, name, sha256) {
 
 export function getPackagingArchitecture(log, platform) {
 	assert.ok(Object.hasOwn(PLATFORMS, platform), "Unknown platform");
-	const matches = [...log.matchAll(/\bpackaging\s+platform=(\S+)\s+arch=(\S+)/g)];
+	const matches = [...stripVTControlCharacters(log).matchAll(/\bpackaging\s+platform=(\S+)\s+arch=(\S+)/g)];
 	assert.equal(matches.length, 1, `Expected exactly one packaging target in ${platform} job log`);
 	assert.equal(matches[0][1], PLATFORMS[platform].os, "Packaging OS differs");
 	const arch = matches[0][2];

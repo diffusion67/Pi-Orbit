@@ -10,6 +10,7 @@ import {
 	assertReleaseIdentity,
 	assertTrustedRun,
 	getArchiveInstaller,
+	getGitHubApiArgs,
 	getPackagingArchitecture,
 	getReleaseAssetName,
 	publishVerifiedDraft,
@@ -172,6 +173,36 @@ test("architecture comes from one unambiguous electron-builder packaging target"
 	for (const log of ["", "running on x64", "packaging platform=linux arch=x64",
 		"packaging platform=darwin arch=universal", "packaging platform=darwin arch=x64\npackaging platform=darwin arch=arm64",
 	]) assert.throws(() => getPackagingArchitecture(log, "macos"));
+});
+
+test("API arguments require an explicit raw-output opt-in for logs and file bytes", () => {
+	const headers = ["-H", "X-GitHub-Api-Version: 2022-11-28", "-H", "Cache-Control: no-cache"];
+	assert.deepEqual(getGitHubApiArgs(`repos/${repo}/releases`), ["api", `repos/${repo}/releases`, ...headers]);
+	for (const endpoint of ["actions/jobs/123/logs", "actions/artifacts/456/zip", "releases/assets/789"]) {
+		assert.deepEqual(getGitHubApiArgs(`repos/${repo}/${endpoint}`, { rawOutput: true }), [
+			"api", `repos/${repo}/${endpoint}`, ...headers, "--allow-escape-sequences",
+		]);
+	}
+});
+
+test("architecture parsing ignores ANSI formatting without weakening target checks", () => {
+	const color = (value) => `\u001b[36m${value}\u001b[0m`;
+	const log = `2026-10-02T00:00:00Z • ${color("packaging")} ${color("platform=darwin")} ${color("arch=arm64")} electron=44.4.5`;
+	assert.equal(getPackagingArchitecture(log, "macos"), "arm64");
+	assert.throws(() => getPackagingArchitecture(log, "windows"), /Packaging OS differs/);
+	assert.throws(() => getPackagingArchitecture(`${log}\n${log}`, "macos"), /Expected exactly one packaging target/);
+	assert.throws(() => getPackagingArchitecture(log.replace("arm64", "universal"), "macos"), /Unsupported or unknown architecture/);
+});
+
+test("publication-only changes rebuild exact-SHA desktop artifacts on pull requests and main", () => {
+	const text = readFileSync(new URL("../.github/workflows/desktop-release-candidate.yml", import.meta.url), "utf8");
+	for (const event of ["push", "pull_request"]) {
+		const block = new RegExp(`^  ${event}:\\n([\\s\\S]*?)(?=^  \\w|^permissions:)`, "m").exec(text)?.[1];
+		assert.ok(block, `Missing ${event} trigger`);
+		for (const path of [".github/workflows/desktop-publish-release.yml", "scripts/desktop-release*.mjs"]) {
+			assert.ok(block.includes(`- "${path}"`), `${event} must rebuild after ${path} changes`);
+		}
+	}
 });
 
 test("an existing tag or any existing release is never overwritten or reused", () => {

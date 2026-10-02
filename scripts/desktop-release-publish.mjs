@@ -6,19 +6,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	assertFreshRelease, assertInstallerFormat, assertPublicationGate, assertReleaseAssets, assertReleaseIdentity, assertTrustedRun,
-	getArchiveInstaller, getPackagingArchitecture, getReleaseAssetName, PLATFORMS, publishVerifiedDraft, REPOSITORY, selectArtifact,
+	getArchiveInstaller, getGitHubApiArgs, getPackagingArchitecture, getReleaseAssetName, PLATFORMS, publishVerifiedDraft, REPOSITORY, selectArtifact,
 	TAG, UPSTREAM_SHA, verifyInstallerChecksum, VERSION, WORKFLOWS,
 } from "./desktop-release-helpers.mjs";
 
 const apiRoot = `repos/${REPOSITORY}`;
-const apiHeaders = ["-H", "X-GitHub-Api-Version: 2022-11-28", "-H", "Cache-Control: no-cache"];
 
 function command(binary, args, options = {}) {
 	return execFileSync(binary, args, { encoding: "utf8", maxBuffer: 32 * 1024 * 1024, ...options });
 }
 
 function json(endpoint, args = []) {
-	return JSON.parse(command("gh", ["api", `${apiRoot}/${endpoint}`, ...apiHeaders, ...args]));
+	return JSON.parse(command("gh", [...getGitHubApiArgs(`${apiRoot}/${endpoint}`), ...args]));
 }
 
 function list(endpoint, key) {
@@ -29,7 +28,8 @@ function list(endpoint, key) {
 function download(endpoint, destination, binary = false) {
 	const fd = openSync(destination, "wx", 0o600);
 	try {
-		command("gh", ["api", `${apiRoot}/${endpoint}`, ...apiHeaders,
+		// Preserve archive/asset bytes, including escapes, only into the opened file.
+		command("gh", [...getGitHubApiArgs(`${apiRoot}/${endpoint}`, { rawOutput: true }),
 			...(binary ? ["-H", "Accept: application/octet-stream"] : [])], { stdio: ["ignore", fd, "pipe"] });
 	} finally {
 		closeSync(fd);
@@ -124,7 +124,8 @@ async function main() {
 		// Reruns may leave old artifacts behind. Require upload during this validated job, not a prior attempt.
 		assert.ok(Date.parse(artifact.created_at) >= Date.parse(job.started_at) &&
 			Date.parse(artifact.created_at) <= Date.parse(job.completed_at), "Artifact predates the validated job attempt");
-		const log = command("gh", ["api", `${apiRoot}/actions/jobs/${job.id}/logs`, ...apiHeaders]);
+		// Capture the raw log for parsing; never print its terminal control sequences.
+		const log = command("gh", getGitHubApiArgs(`${apiRoot}/actions/jobs/${job.id}/logs`, { rawOutput: true }));
 		const arch = getPackagingArchitecture(log, platform);
 		const archive = join(work, `${platform}.zip`);
 		download(`actions/artifacts/${artifact.id}/zip`, archive);
@@ -233,7 +234,7 @@ async function main() {
 			// POST rejects duplicate names; there is intentionally no delete/overwrite path.
 			for (const file of files) {
 				const endpoint = `https://uploads.github.com/${apiRoot}/releases/${draft.id}/assets?name=${encodeURIComponent(file.name)}`;
-				command("gh", ["api", endpoint, ...apiHeaders, "--method", "POST",
+				command("gh", [...getGitHubApiArgs(endpoint), "--method", "POST",
 					"-H", "Content-Type: application/octet-stream", "--input", file.path]);
 			}
 		},

@@ -7,6 +7,8 @@ on:
     paths:
       - ".github/workflows/desktop-release-candidate.yml"
       - ".github/workflows/desktop-signed-candidate.yml"
+      - ".github/workflows/desktop-publish-release.yml"
+      - "scripts/desktop-release*.mjs"
       - "packages/desktop/**"
       - "packages/**/src/**"
       - "packages/**/package.json"
@@ -17,6 +19,8 @@ on:
     paths:
       - ".github/workflows/desktop-release-candidate.yml"
       - ".github/workflows/desktop-signed-candidate.yml"
+      - ".github/workflows/desktop-publish-release.yml"
+      - "scripts/desktop-release*.mjs"
       - "packages/desktop/**"
       - "packages/**/src/**"
       - "packages/**/package.json"
