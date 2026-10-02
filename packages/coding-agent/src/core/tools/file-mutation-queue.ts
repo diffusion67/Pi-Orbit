@@ -1,5 +1,5 @@
 import { realpath } from "node:fs/promises";
-import { resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 const fileMutationQueues = new Map<string, Promise<void>>();
 let registrationQueue = Promise.resolve();
@@ -19,7 +19,10 @@ async function getMutationQueueKey(filePath: string): Promise<string> {
 		return await realpath(resolvedPath);
 	} catch (error) {
 		if (isMissingPathError(error)) {
-			return resolvedPath;
+			const parent = dirname(resolvedPath);
+			if (parent === resolvedPath) return resolvedPath;
+			// Keep the key stable through creation, including missing parents beneath a directory alias.
+			return join(await getMutationQueueKey(parent), basename(resolvedPath));
 		}
 		throw error;
 	}

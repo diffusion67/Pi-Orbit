@@ -92,6 +92,7 @@ export const WorkerRequestSchema = Type.Union([
 		type: Type.Literal("prompt"),
 		payload: strict({
 			text: Type.String({ maxLength: 100_000 }),
+			runId: Type.Optional(text(128)),
 			attachments: Type.Optional(Type.Array(DesktopAttachmentSchema, { maxItems: MAX_ATTACHMENT_COUNT })),
 		}),
 	}),
@@ -255,6 +256,8 @@ export type WorkerEvent =
 			readonly event: {
 				readonly type: "state";
 				readonly state: "ready" | "streaming" | "idle" | "failed" | "closed";
+				readonly runId?: string;
+				readonly outcome?: "completed" | "aborted";
 				readonly sessionId?: string;
 				readonly sessionFile?: string;
 				readonly message?: string;

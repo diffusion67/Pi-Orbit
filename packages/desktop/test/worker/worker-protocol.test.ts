@@ -5,6 +5,9 @@ describe("desktop worker protocol", () => {
 	it("accepts supported commands with strict payloads", () => {
 		expect(isWorkerRequest({ id: "1", type: "init", payload: { cwd: "C:/repo", tools: ["read"] } })).toBe(true);
 		expect(isWorkerRequest({ id: "2", type: "prompt", payload: { text: "hello" } })).toBe(true);
+		expect(isWorkerRequest({ id: "run", type: "prompt", payload: { text: "hello", runId: "task-run-1" } })).toBe(
+			true,
+		);
 		expect(isWorkerRequest({ id: "3", type: "message", payload: { text: "continue", deliverAs: "followUp" } })).toBe(
 			true,
 		);

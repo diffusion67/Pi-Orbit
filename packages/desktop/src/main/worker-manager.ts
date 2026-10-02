@@ -80,6 +80,7 @@ export class AgentWorkerManager {
 		const slot: Slot = { process, pending: new Map(), exited, settleExit, expectedExit: false };
 		this.slots.set(key, slot);
 		process.onMessage((message) => {
+			if (this.slots.get(key) !== slot) return;
 			const response = responseFrom(message);
 			if (response !== undefined) {
 				const pending = slot.pending.get(response.id);

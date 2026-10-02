@@ -1829,6 +1829,8 @@ export class SessionManager {
 		if (!sourceHeader) {
 			throw new Error(`Cannot fork: source session has no header: ${resolvedSourcePath}`);
 		}
+		// Migrate the copied entries before replacing their versioned header, without rewriting the source.
+		migrateToCurrentVersion(sourceEntries);
 
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(resolvedTargetCwd);
 		if (!existsSync(dir)) {

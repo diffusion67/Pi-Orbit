@@ -429,7 +429,7 @@ export class Server<TMetadata extends SessionMetadata = SessionMetadata> {
 		delete connection.serverServices;
 		void Promise.allSettled([
 			this.sessions.disconnect(connection, TODO_CONTEXT),
-			serverServices?.release(TODO_CONTEXT),
+			Promise.resolve().then(() => serverServices?.release(TODO_CONTEXT)),
 		]).then((results) => {
 			for (const result of results) if (result.status === "rejected") this.reportError(result.reason);
 		});

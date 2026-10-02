@@ -43,9 +43,35 @@ class FakeWorker implements WorkerTransport {
 	exit(code: number): void {
 		this.onExitCallback(code);
 	}
+	emit(message: unknown): void {
+		this.onMessageCallback(message);
+	}
 }
 
 describe("AgentWorkerManager", () => {
+	// PR #5 review: late messages from an exited process cannot belong to its replacement.
+	it("ignores messages from an exited worker after the same key is reused", async () => {
+		const workers = [new FakeWorker(), new FakeWorker()];
+		let next = 0;
+		const events: unknown[] = [];
+		const manager = new AgentWorkerManager({
+			createProcess: () => workers[next++]!,
+			onEvent: (_key, event) => events.push(event),
+			onUnexpectedExit: () => {},
+		});
+		const first = manager.start("task", { cwd: process.cwd() });
+		workers[0]!.respond(0, { sessionId: "first" });
+		await first;
+		workers[0]!.exit(1);
+		const second = manager.start("task", { cwd: process.cwd() });
+		workers[1]!.respond(0, { sessionId: "second" });
+		await second;
+		workers[0]!.emit({ type: "event", event: { type: "ui.request", requestId: "ui-1" } });
+		workers[1]!.emit({ type: "event", event: { type: "ui.request", requestId: "ui-2" } });
+		expect(events).toEqual([{ type: "ui.request", requestId: "ui-2" }]);
+		workers[1]!.exit(0);
+	});
+
 	it("waits for a failed initialization worker to exit before releasing its slot", async () => {
 		const worker = new FakeWorker();
 		worker.exitOnKill = false;
