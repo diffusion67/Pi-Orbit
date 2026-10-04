@@ -176,6 +176,7 @@ try {
 		...uiSettings,
 		defaultModel: "orbit-smoke/smoke",
 		confirmToolCalls: false,
+		subagentsEnabled: true,
 	}), "save settings");
 	await waitFor(async () => (await cdp.evaluate("document.documentElement.lang")) === "zh-CN", "Chinese desktop language");
 	const session = assertOk(await invoke(cdp, "session.create", { projectId: project.id, model: "orbit-smoke/smoke" }), "create faux-model session");
