@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -209,7 +209,10 @@ describe("native session capability bridge", () => {
 				.flatMap((worker) => worker.requests)
 				.find((request) => request.type === "session.import");
 			expect(request?.payload.sessionFile).not.toBe(selectedFile);
-			expect(request?.payload.cwdOverride).toBe(join(root, "project"));
+			const cwdOverride = request?.payload.cwdOverride;
+			expect(typeof cwdOverride).toBe("string");
+			if (typeof cwdOverride !== "string") throw new Error("Imported session has no project working directory");
+			expect(await realpath(cwdOverride)).toBe(await realpath(join(root, "project")));
 			expect((await readdir(join(root, "data"))).filter((name) => name.startsWith("import-"))).toEqual([]);
 			expect(await service.invoke("session.import", { projectId })).toMatchObject({
 				ok: false,
