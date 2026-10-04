@@ -84,6 +84,15 @@ describe("desktop worker protocol", () => {
 		expect(
 			parseMcpServerConfigJson('{"url":"https://example.com/mcp","headers":{"Authorization":"Bearer secret"}}'),
 		).toMatchObject({ url: "https://example.com/mcp" });
+		expect(
+			parseMcpServerConfigJson('{"url":"https://example.com/mcp","oauth":{"clientRegistration":"dcr"}}'),
+		).toMatchObject({ oauth: { clientRegistration: "dcr" } });
+		expect(
+			parseMcpServerConfigJson('{"url":"https://example.com/mcp","oauth":{"clientRegistration":"cimd"}}'),
+		).toMatchObject({ oauth: { clientRegistration: "cimd" } });
+		expect(() =>
+			parseMcpServerConfigJson('{"url":"https://example.com/mcp","oauth":{"clientRegistration":"unknown"}}'),
+		).toThrow("supported stdio or HTTP server");
 		expect(() => parseMcpServerConfigJson('{"url":"https://example.com/mcp","arbitrary":"value"}')).toThrow(
 			"supported stdio or HTTP server",
 		);

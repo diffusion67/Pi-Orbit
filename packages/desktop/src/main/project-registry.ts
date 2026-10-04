@@ -12,6 +12,7 @@ export type StoredSession = {
 	readonly updatedAt: string;
 	readonly model: string;
 	readonly status: "idle" | "running" | "error";
+	readonly archived?: boolean;
 };
 
 type ProjectRow = { readonly id: string; readonly name: string; readonly path: string };
@@ -23,6 +24,7 @@ type SessionRow = {
 	readonly updated_at: string;
 	readonly model: string;
 	readonly status: StoredSession["status"];
+	readonly archived: number;
 };
 type MetaRow = { readonly value: string };
 
@@ -35,6 +37,7 @@ function fromSessionRow(row: SessionRow): StoredSession {
 		updatedAt: row.updated_at,
 		model: row.model,
 		status: row.status,
+		archived: row.archived === 1,
 	};
 }
 
@@ -61,8 +64,15 @@ export class ProjectRegistry {
 			title TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
 			model TEXT NOT NULL,
-			status TEXT NOT NULL CHECK (status IN ('idle','running','error'))
+			status TEXT NOT NULL CHECK (status IN ('idle','running','error')),
+			archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0,1))
 		) STRICT`);
+			const columns = await tx.all<{ name: string }>("PRAGMA table_info(desktop_sessions)");
+			if (!columns.some((column) => column.name === "archived")) {
+				await tx.exec(
+					"ALTER TABLE desktop_sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0,1))",
+				);
+			}
 			await tx.exec(
 				"CREATE INDEX IF NOT EXISTS desktop_sessions_by_project ON desktop_sessions (project_id, updated_at)",
 			);
@@ -118,8 +128,8 @@ export class ProjectRegistry {
 
 	async upsertSession(session: StoredSession): Promise<void> {
 		await this.db.run(
-			`INSERT INTO desktop_sessions (id, project_id, file, title, updated_at, model, status)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
+			`INSERT INTO desktop_sessions (id, project_id, file, title, updated_at, model, status, archived)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET project_id=excluded.project_id, file=excluded.file,
 				updated_at=excluded.updated_at, model=excluded.model, status=excluded.status`,
 			session.id,
@@ -129,6 +139,28 @@ export class ProjectRegistry {
 			session.updatedAt,
 			session.model,
 			session.status,
+			session.archived === true ? 1 : 0,
+		);
+	}
+
+	async setSessionArchived(id: string, archived: boolean): Promise<void> {
+		await this.db.transaction(async (tx) => {
+			const session = await tx.get<SessionRow>("SELECT * FROM desktop_sessions WHERE id = ?", id);
+			if (session === undefined) throw new Error(`Unknown session ${id}`);
+			if (archived && session.status === "running") throw new Error("A running session cannot be archived");
+			await tx.run("UPDATE desktop_sessions SET archived = ? WHERE id = ?", archived ? 1 : 0, id);
+			if (archived && (await this.getMeta(tx, "activeSessionId")) === id) {
+				await this.deleteMeta(tx, "activeSessionId");
+			}
+		});
+	}
+
+	async setSessionStatus(id: string, status: StoredSession["status"]): Promise<void> {
+		await this.db.run(
+			"UPDATE desktop_sessions SET status = ?, updated_at = ? WHERE id = ? AND archived = 0",
+			status,
+			new Date().toISOString(),
+			id,
 		);
 	}
 
@@ -162,6 +194,7 @@ export class ProjectRegistry {
 		return this.db.transaction(async (tx) => {
 			const row = await tx.get<SessionRow>("SELECT * FROM desktop_sessions WHERE id = ?", id);
 			if (row === undefined) throw new Error(`Unknown session ${id}`);
+			if (row.archived === 1) throw new Error("An archived session must be restored before selecting it");
 			await this.setMeta(tx, "activeSessionId", id);
 			await this.setMeta(tx, "activeProjectId", row.project_id);
 			return fromSessionRow(row);

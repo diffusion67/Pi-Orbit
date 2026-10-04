@@ -9,18 +9,21 @@ import {
 	assertReleaseAssets,
 	assertReleaseIdentity,
 	assertTrustedRun,
+	assertUpstreamAncestor,
 	getArchiveInstaller,
 	getGitHubApiArgs,
 	getPackagingArchitecture,
 	getReleaseAssetName,
 	publishVerifiedDraft,
 	selectArtifact,
+	UPSTREAM_SHA,
 	verifyInstallerChecksum,
+	VERSION,
 } from "./desktop-release-helpers.mjs";
 
 const repo = "diffusion67/Pi-Orbit";
 const sha = "a".repeat(40);
-const version = "0.1.0-rc.1";
+const version = "0.1.0-rc.2";
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const workflow = { id: 10, name: "CI", path: ".github/workflows/ci.yml" };
 const desktopWorkflow = {
@@ -76,6 +79,24 @@ const gate = () => ({
 	desktop: { workflow: desktopWorkflow, run: run(desktopWorkflow), jobs: desktopJobs() },
 });
 
+test("release metadata pins the new desktop version and frozen Pi upstream commit", () => {
+	assert.equal(VERSION, "0.1.0-rc.2");
+	assert.equal(UPSTREAM_SHA, "200387122ca450d6387f033949423114a270b96c");
+});
+
+test("the release notes template is versioned and contains all verified run fields", () => {
+	const template = readFileSync(new URL(`../packages/desktop/docs/releases/${VERSION}.md`, import.meta.url), "utf8");
+	assert.ok(template.startsWith(`# Pi Orbit ${VERSION}`));
+	for (const field of ["SOURCE_SHA", "UPSTREAM_SHA", "CI_RUN_URL", "DESKTOP_RUN_URL", "ARTIFACTS", "CHECKSUMS"]) {
+		assert.ok(template.includes(`{{${field}}}`), `Release notes are missing ${field}`);
+	}
+});
+
+test("the publisher concurrency group matches the approved desktop release", () => {
+	const workflow = readFileSync(new URL("../.github/workflows/desktop-publish-release.yml", import.meta.url), "utf8");
+	assert.ok(workflow.includes(`group: pi-orbit-publish-${VERSION}`));
+});
+
 test("only trusted successful main push runs for the exact SHA qualify", () => {
 	assert.equal(assertTrustedRun(run(), workflow, sha), undefined);
 	for (const patch of [
@@ -85,11 +106,19 @@ test("only trusted successful main push runs for the exact SHA qualify", () => {
 	]) assert.throws(() => assertTrustedRun({ ...run(), ...patch }, workflow, sha));
 });
 
+test("release source history must contain the frozen Pi upstream commit", () => {
+	const sourceSha = "a".repeat(40);
+	const upstreamSha = UPSTREAM_SHA;
+	assert.equal(assertUpstreamAncestor(sourceSha, upstreamSha, (ancestor, source) => ancestor === upstreamSha && source === sourceSha), undefined);
+	assert.throws(() => assertUpstreamAncestor(sourceSha, upstreamSha, () => false), /not in the release source history/);
+	assert.throws(() => assertUpstreamAncestor(sourceSha, "bad", () => true), /Invalid pinned upstream SHA/);
+});
+
 test("publication needs both latest exact-SHA runs and the unchanged live main", () => {
 	assert.equal(assertPublicationGate(gate()), undefined);
 	for (const patch of [
 		{ liveSha: "b".repeat(40) }, { sourceSha: "bad" }, { repository: "fork/Pi-Orbit" },
-		{ eventName: "pull_request_target" }, { ref: "refs/heads/other" }, { version: "0.1.0-rc.2" },
+		{ eventName: "pull_request_target" }, { ref: "refs/heads/other" }, { version: "0.1.0-rc.1" },
 		{ trigger: { ...run(), id: 999 } },
 		{ desktop: { ...gate().desktop, run: { ...run(desktopWorkflow), head_sha: "b".repeat(40) } } },
 	]) assert.throws(() => assertPublicationGate({ ...gate(), ...patch }));
@@ -121,21 +150,22 @@ test("artifacts must uniquely belong to the validated run and SHA and remain dow
 });
 
 test("archive allows exactly one versioned installer plus SHA256SUMS with safe flat names", () => {
-	const name = "Pi Orbit Setup 0.1.0-rc.1.exe";
+	const name = "Pi Orbit Setup 0.1.0-rc.2.exe";
 	assert.equal(getArchiveInstaller([name, "SHA256SUMS"], "windows"), name);
 	for (const names of [[name], [name, name, "SHA256SUMS"], [name, "SHA256SUMS", "surprise.sh"],
 		["../bad.exe", "SHA256SUMS"], ["Pi Orbit 0.0.3.exe", "SHA256SUMS"],
-		["Pi Orbit 0.1.0-rc.1.dmg", "SHA256SUMS"], ["bad*0.1.0-rc.1.exe", "SHA256SUMS"],
-		["Pi Orbit 0.1.0-rc.10.exe", "SHA256SUMS"],
+		["Pi Orbit Setup 0.1.0-rc.1.exe", "SHA256SUMS"],
+		["Pi Orbit 0.1.0-rc.2.dmg", "SHA256SUMS"], ["bad*0.1.0-rc.2.exe", "SHA256SUMS"],
+		["Pi Orbit 0.1.0-rc.20.exe", "SHA256SUMS"],
 	]) assert.throws(() => getArchiveInstaller(names, "windows"));
 });
 
 test("release installer filenames are stable under GitHub asset sanitization", () => {
 	for (const [original, expected] of [
-		["Pi Orbit Setup 0.1.0-rc.1.exe", "Pi-Orbit-Setup-0.1.0-rc.1.exe"],
-		["Pi Orbit-0.1.0-rc.1-arm64.dmg", "Pi-Orbit-0.1.0-rc.1-arm64.dmg"],
-		["Pi Orbit-0.1.0-rc.1.AppImage", "Pi-Orbit-0.1.0-rc.1.AppImage"],
-		["Pi-Orbit-0.1.0-rc.1.exe", "Pi-Orbit-0.1.0-rc.1.exe"],
+		["Pi Orbit Setup 0.1.0-rc.2.exe", "Pi-Orbit-Setup-0.1.0-rc.2.exe"],
+		["Pi Orbit-0.1.0-rc.2-arm64.dmg", "Pi-Orbit-0.1.0-rc.2-arm64.dmg"],
+		["Pi Orbit-0.1.0-rc.2.AppImage", "Pi-Orbit-0.1.0-rc.2.AppImage"],
+		["Pi-Orbit-0.1.0-rc.2.exe", "Pi-Orbit-0.1.0-rc.2.exe"],
 	]) assert.equal(getReleaseAssetName(original), expected);
 	for (const name of ["../bad.exe", "bad(1).exe", ".bad.exe", "bad.exe.", "bad/exe", ""]) {
 		assert.throws(() => getReleaseAssetName(name));
@@ -158,7 +188,7 @@ test("installer signatures reject renamed text files and contradictory AppImage 
 });
 
 test("installer checksum must exactly match the downloaded bytes and filename", () => {
-	const name = "Pi Orbit Setup 0.1.0-rc.1.exe";
+	const name = "Pi Orbit Setup 0.1.0-rc.2.exe";
 	const bytes = Buffer.from("installer");
 	const digest = hash(bytes);
 	assert.equal(verifyInstallerChecksum(`${digest}  ${name}\r\n`, name, digest), digest);
@@ -207,6 +237,8 @@ test("publication-only changes rebuild exact-SHA desktop artifacts on pull reque
 
 test("an existing tag or any existing release is never overwritten or reused", () => {
 	assert.equal(assertFreshRelease([], []), undefined);
+	assert.equal(assertFreshRelease([{ tag_name: "pi-orbit-v0.1.0-rc.1", draft: false }], []), undefined);
+	assert.equal(assertFreshRelease([], [{ ref: "refs/tags/pi-orbit-v0.1.0-rc.1" }]), undefined);
 	for (const draft of [true, false]) assert.throws(() => assertFreshRelease([{ tag_name: `pi-orbit-v${version}`, draft }], []));
 	assert.throws(() => assertFreshRelease([], [{ ref: `refs/tags/pi-orbit-v${version}` }]));
 	assert.equal(assertFreshRelease([{ tag_name: "other" }], [{ ref: "refs/tags/other" }]), undefined);
@@ -268,6 +300,7 @@ test("workflow confines publication to trusted push-main completion and job-loca
 	assert.match(text, /cancel-in-progress: false/);
 	assert.match(text, /contents: write\n\s+actions: read/);
 	assert.match(text, /persist-credentials: false/);
+	assert.match(text, /fetch-depth: 0/);
 	assert.doesNotMatch(text, /pull_request(?:_target)?:|workflow_dispatch:|secrets\.|npm publish|--clobber/);
 	for (const line of text.split("\n").filter((line) => /uses:/.test(line))) assert.match(line, /@[a-f0-9]{40}(?:\s|$)/);
 });

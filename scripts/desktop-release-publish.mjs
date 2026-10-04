@@ -5,7 +5,7 @@ import { closeSync, createReadStream, mkdirSync, mkdtempSync, openSync, readFile
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-	assertFreshRelease, assertInstallerFormat, assertPublicationGate, assertReleaseAssets, assertReleaseIdentity, assertTrustedRun,
+	assertFreshRelease, assertInstallerFormat, assertPublicationGate, assertReleaseAssets, assertReleaseIdentity, assertTrustedRun, assertUpstreamAncestor,
 	getArchiveInstaller, getGitHubApiArgs, getPackagingArchitecture, getReleaseAssetName, PLATFORMS, publishVerifiedDraft, REPOSITORY, selectArtifact,
 	TAG, UPSTREAM_SHA, verifyInstallerChecksum, VERSION, WORKFLOWS,
 } from "./desktop-release-helpers.mjs";
@@ -92,6 +92,14 @@ async function main() {
 	assert.ok(triggerWorkflow, "Unexpected trigger workflow");
 	assertTrustedRun(trigger, { ...triggerWorkflow, id: trigger.workflow_id }, trigger.head_sha);
 	assert.equal(command("git", ["rev-parse", "HEAD"]).trim(), trigger.head_sha, "Checkout does not match source");
+	assertUpstreamAncestor(trigger.head_sha, UPSTREAM_SHA, (upstreamSha, sourceSha) => {
+		try {
+			execFileSync("git", ["merge-base", "--is-ancestor", upstreamSha, sourceSha], { stdio: "ignore" });
+			return true;
+		} catch {
+			return false;
+		}
+	});
 	const version = JSON.parse(readFileSync("packages/desktop/package.json", "utf8")).version;
 	assert.equal(version, VERSION, "Outside the single approved desktop version");
 	const gate = readGate(env, event, version);

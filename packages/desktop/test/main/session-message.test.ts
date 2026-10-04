@@ -127,7 +127,11 @@ describe("session messages", () => {
 				ok: true,
 				data: { accepted: true },
 			});
-			assert.deepEqual(workers.at(-1)?.requests.at(-1), { type: "prompt", payload: { text: "start work" } });
+			const prompt = workers.at(-1)?.requests.at(-1);
+			assert.ok(isRecord(prompt?.payload));
+			const runId = prompt.payload.runId;
+			assert.equal(typeof runId, "string");
+			assert.deepEqual(prompt, { type: "prompt", payload: { text: "start work", runId } });
 			for (const deliverAs of ["steer", "followUp"] as const) {
 				assert.deepEqual(
 					await service.invoke("session.message", { sessionId, text: `queued ${deliverAs}`, deliverAs }),
@@ -135,11 +139,11 @@ describe("session messages", () => {
 				);
 			}
 			assert.deepEqual(workers.at(-1)?.requests.slice(-2), [
-				{ type: "message", payload: { text: "queued steer", deliverAs: "steer" } },
-				{ type: "message", payload: { text: "queued followUp", deliverAs: "followUp" } },
+				{ type: "message", payload: { text: "queued steer", deliverAs: "steer", expectedRunId: runId } },
+				{ type: "message", payload: { text: "queued followUp", deliverAs: "followUp", expectedRunId: runId } },
 			]);
 
-			workers.at(-1)?.emit({ type: "state", state: "idle", sessionId });
+			workers.at(-1)?.emit({ type: "state", state: "idle", sessionId, runId });
 			for (let attempt = 0; attempt < 100 && (await service.snapshot()).sessions[0]?.status !== "idle"; attempt++)
 				await new Promise((resolve) => setTimeout(resolve, 10));
 			assert.deepEqual(
@@ -181,9 +185,13 @@ describe("session messages", () => {
 					data: { accepted: true },
 				},
 			);
-			assert.deepEqual(workers.at(-1)?.requests.at(-1), {
+			const prompt = workers.at(-1)?.requests.at(-1);
+			assert.ok(isRecord(prompt?.payload));
+			const runId = prompt.payload.runId;
+			assert.equal(typeof runId, "string");
+			assert.deepEqual(prompt, {
 				type: "prompt",
-				payload: { text: "Review", attachments },
+				payload: { text: "Review", attachments, runId },
 			});
 			workers.at(-1)?.emit({
 				type: "message",
@@ -217,7 +225,7 @@ describe("session messages", () => {
 			);
 			assert.deepEqual(workers.at(-1)?.requests.at(-1), {
 				type: "message",
-				payload: { text: "queue context", deliverAs: "followUp", attachments },
+				payload: { text: "queue context", deliverAs: "followUp", attachments, expectedRunId: runId },
 			});
 			assert.deepEqual(
 				await service.invoke("session.prompt", { sessionId: session.data.id, text: "", attachments: [] }),

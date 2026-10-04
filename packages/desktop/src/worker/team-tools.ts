@@ -85,7 +85,7 @@ export function createDesktopTeamTools(callMain: MainTeamCall): ToolDefinition<T
 		tool(
 			"task_wait",
 			"Wait for task",
-			"Wait up to one minute for a delegated task to change state and return its summary.",
+			"Wait up to one minute for a delegated task to finish, pause, or require review, and return its summary.",
 			waitParameters,
 			(params, signal) => callMain({ action: "task.wait", payload: params }, signal),
 		),

@@ -41,6 +41,7 @@ import {
 } from "../shared/worker-protocol.ts";
 import { listDesktopResources, runDesktopResource } from "./resource-catalog.ts";
 import { createDesktopTeamTools } from "./team-tools.ts";
+import { DesktopToolPolicy } from "./tool-policy.ts";
 
 type InitRequest = Extract<WorkerRequest, { readonly type: "init" }>;
 type InitPayload = InitRequest["payload"];
@@ -58,6 +59,7 @@ export interface DesktopWorkerHostOptions {
 		input: InitPayload,
 		customTools: ToolDefinition[],
 		onMcpManager: (manager: McpManagerHandle | undefined) => void,
+		toolPolicy: DesktopToolPolicy,
 	) => Promise<AgentSessionRuntime>;
 	readonly onShutdown?: () => void;
 }
@@ -231,13 +233,85 @@ function sessionMessages(runtime: AgentSessionRuntime): JsonValue {
 	return messages.slice(-500).map((message) => safeJson(message));
 }
 
+const MAX_QUEUE_PREVIEW_ITEMS = 50;
+const MAX_QUEUE_PREVIEW_TEXT = 2_000;
+
+function queuePreview(
+	steering: readonly string[],
+	followUp: readonly string[],
+	pendingCount: number,
+): { steering: string[]; followUp: string[]; pendingCount: number; truncated: boolean } {
+	let truncated = false;
+	const preview = (items: readonly string[]): string[] => {
+		if (items.length > MAX_QUEUE_PREVIEW_ITEMS) truncated = true;
+		return items.slice(0, MAX_QUEUE_PREVIEW_ITEMS).map((item) => {
+			const redacted = redactText(item);
+			if (redacted.length > MAX_QUEUE_PREVIEW_TEXT) truncated = true;
+			return redacted.slice(0, MAX_QUEUE_PREVIEW_TEXT);
+		});
+	};
+	return {
+		steering: preview(steering),
+		followUp: preview(followUp),
+		pendingCount,
+		truncated,
+	};
+}
+
+function sessionTree(runtime: AgentSessionRuntime): {
+	entries: Array<{
+		id: string;
+		parentId: string | null;
+		type: string;
+		label: string;
+		role?: string;
+		timestamp?: number;
+	}>;
+	leafId: string | null;
+} {
+	const entries: Array<{
+		id: string;
+		parentId: string | null;
+		type: string;
+		label: string;
+		role?: string;
+		timestamp?: number;
+	}> = [];
+	const visit = (nodes: ReturnType<typeof runtime.session.sessionManager.getTree>): void => {
+		for (const node of nodes) {
+			const entry = node.entry;
+			let label = node.label ?? "";
+			let role: string | undefined;
+			let timestamp: number | undefined;
+			if (entry.type === "message") {
+				role = entry.message.role;
+				timestamp = entry.message.timestamp;
+				if (!label && (role === "user" || role === "assistant")) label = textFromMessage(entry.message);
+			}
+			entries.push({
+				id: entry.id,
+				parentId: entry.parentId,
+				type: entry.type,
+				label: redactText(label).slice(0, 240),
+				...(role === undefined ? {} : { role }),
+				...(timestamp === undefined ? {} : { timestamp }),
+			});
+			visit(node.children);
+		}
+	};
+	visit(runtime.session.sessionManager.getTree());
+	return { entries, leafId: runtime.session.sessionManager.getLeafId() };
+}
+
 export async function createPiRuntime(
 	input: InitPayload,
 	customTools: ToolDefinition[] = [],
 	onMcpManager?: (manager: McpManagerHandle | undefined) => void,
+	toolPolicy = new DesktopToolPolicy(input.confirmToolCalls ?? true),
 ): Promise<AgentSessionRuntime> {
 	const agentDir = input.agentDir ?? process.env.PI_AGENT_DIR ?? getAgentDir();
 	const sessionManager = createDesktopSessionManager({ ...input, agentDir });
+	toolPolicy.bindSessionManager(sessionManager, input.toolMode);
 	const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 		cwd,
 		agentDir,
@@ -253,6 +327,7 @@ export async function createPiRuntime(
 					createCodemodeExtension(),
 					createToolSearchExtension(),
 					createMcpExtension({ agentDir: input.agentDir ?? agentDir, onManager: onMcpManager }),
+					toolPolicy.extensionFactory,
 				],
 			},
 		});
@@ -310,7 +385,10 @@ export class DesktopWorkerHost {
 	private shuttingDown = false;
 	private nextUiRequest = 0;
 	private extensionToolsExpanded = false;
+	private providerRefreshPending = false;
 	private activeRun?: PromptRun;
+	private sessionMutationPending = false;
+	private toolPolicy = new DesktopToolPolicy();
 
 	constructor(port: DesktopWorkerPort, options: DesktopWorkerHostOptions = {}) {
 		this.port = port;
@@ -447,12 +525,17 @@ export class DesktopWorkerHost {
 		if (this.initialized) return this.reject(request.id, "ALREADY_INITIALIZED", "Worker is already initialized");
 		this.initialized = true;
 		try {
+			this.toolPolicy = new DesktopToolPolicy(request.payload.confirmToolCalls ?? true);
 			const customTools = request.payload.enableTeamTools
 				? createDesktopTeamTools((mainRequest, signal) => this.requestMain(mainRequest, signal))
 				: [];
-			this.runtime = await this.createRuntime(request.payload, customTools, (manager) =>
-				this.bindMcpManager(manager),
+			this.runtime = await this.createRuntime(
+				request.payload,
+				customTools,
+				(manager) => this.bindMcpManager(manager),
+				this.toolPolicy,
 			);
+			this.toolPolicy.bindSessionManager(this.runtime.session.sessionManager, request.payload.toolMode);
 			await this.bindDesktopExtensions(this.runtime);
 			this.unsubscribeSession = this.runtime.session.subscribe((event) => this.publishSessionEvent(event));
 			for (const diagnostic of this.runtime.diagnostics) {
@@ -478,6 +561,8 @@ export class DesktopWorkerHost {
 				sessionFile: this.runtime.session.sessionFile ?? null,
 				model: modelDto(model),
 				messages: sessionMessages(this.runtime),
+				queue: this.queueState(),
+				toolPolicy: this.toolPolicy.getState(),
 			});
 		} catch (error) {
 			this.initialized = false;
@@ -491,8 +576,19 @@ export class DesktopWorkerHost {
 		const runtime = this.runtime!;
 		switch (request.type) {
 			case "prompt": {
+				if (this.sessionMutationPending)
+					return this.reject(request.id, "OPERATION_FAILED", "Session state is being updated");
+				if (this.providerRefreshPending)
+					return this.reject(request.id, "OPERATION_FAILED", "Provider configuration is being refreshed");
 				if (runtime.session.isStreaming || this.activeRun)
 					return this.reject(request.id, "OPERATION_FAILED", "Session is already streaming");
+				const selectedModel = runtime.session.model;
+				if (selectedModel && !runtime.services.modelRuntime.getModel(selectedModel.provider, selectedModel.id))
+					return this.reject(
+						request.id,
+						"NOT_FOUND",
+						"The selected model is no longer configured. Select another model before continuing.",
+					);
 				validateSessionInput(request.payload.text, request.payload.attachments);
 				const text = appendTextAttachments(request.payload.text, request.payload.attachments);
 				const images = imageContentFromAttachments(request.payload.attachments);
@@ -523,58 +619,171 @@ export class DesktopWorkerHost {
 				return;
 			}
 			case "message": {
+				if (this.sessionMutationPending)
+					return this.reject(request.id, "OPERATION_FAILED", "Session state is being updated");
+				if (this.providerRefreshPending)
+					return this.reject(request.id, "OPERATION_FAILED", "Provider configuration is being refreshed");
+				const run = this.activeRun;
+				if (!run || !runtime.session.isStreaming)
+					return this.reject(
+						request.id,
+						"OPERATION_FAILED",
+						"Session is no longer running; keep the message in the editor",
+					);
+				if (request.payload.expectedRunId !== undefined && request.payload.expectedRunId !== run.id)
+					return this.reject(
+						request.id,
+						"OPERATION_FAILED",
+						"Message targets a stale session run; keep it in the editor",
+					);
+				const selectedModel = runtime.session.model;
+				if (selectedModel && !runtime.services.modelRuntime.getModel(selectedModel.provider, selectedModel.id))
+					return this.reject(
+						request.id,
+						"NOT_FOUND",
+						"The selected model is no longer configured. Select another model before continuing.",
+					);
 				validateSessionInput(request.payload.text, request.payload.attachments);
 				const text = appendTextAttachments(request.payload.text, request.payload.attachments);
 				const images = imageContentFromAttachments(request.payload.attachments);
-				const runId = this.activeRun?.id;
-				this.respond(request.id, { accepted: true, delivery: request.payload.deliverAs });
-				void runtime.session
-					.prompt(text, {
-						source: "rpc",
-						streamingBehavior: request.payload.deliverAs,
-						...(images.length === 0 ? {} : { images }),
-					})
-					.catch((error: unknown) => {
-						const message = redactText(errorMessage(error));
-						this.emit({
-							type: "event",
-							event: {
-								type: "state",
-								state: "failed",
-								sessionId: runtime.session.sessionId,
-								message,
-								...(runId ? { runId } : {}),
-							},
-						});
-						this.emit({ type: "event", event: { type: "diagnostic", level: "error", message } });
-					});
+				const disposition =
+					request.payload.deliverAs === "steer"
+						? await runtime.session.steer(text, images.length === 0 ? undefined : images, { source: "rpc" })
+						: await runtime.session.followUp(text, images.length === 0 ? undefined : images, { source: "rpc" });
+				this.respond(request.id, { accepted: true, delivery: request.payload.deliverAs, disposition });
 				return;
 			}
-			case "compact": {
-				const result = await runtime.session.compact(request.payload.instructions);
-				this.respond(request.id, safeJson(result));
+			case "queue.get":
+				this.respond(request.id, this.queueState());
 				return;
-			}
-			case "fork": {
-				const result = await runtime.fork(request.payload.entryId, { position: request.payload.position });
-				await this.afterSessionReplacement(runtime);
+			case "queue.clear": {
+				const cleared = runtime.session.clearQueue();
 				this.respond(request.id, {
-					cancelled: result.cancelled,
-					selectedText: result.selectedText ?? null,
-					...this.sessionDto(runtime),
+					steering: cleared.steering.map(redactText),
+					followUp: cleared.followUp.map(redactText),
+					pendingCount: 0,
 				});
 				return;
 			}
+			case "tool.policy.get":
+				this.respond(request.id, this.toolPolicy.getState());
+				return;
+			case "tool.policy.set": {
+				const { confirmToolCalls, mode } = request.payload;
+				if (confirmToolCalls === undefined && mode === undefined)
+					return this.reject(request.id, "INVALID_ARGUMENT", "Specify a confirmation setting or tool mode");
+				if (
+					mode !== undefined &&
+					(!runtime.session.isIdle || this.activeRun !== undefined || this.sessionMutationPending)
+				)
+					return this.reject(
+						request.id,
+						"OPERATION_FAILED",
+						"Tool mode can only change while the session is idle",
+					);
+				if (confirmToolCalls !== undefined) this.toolPolicy.setConfirmToolCalls(confirmToolCalls);
+				if (mode !== undefined) this.toolPolicy.setMode(mode);
+				this.respond(request.id, this.toolPolicy.getState());
+				return;
+			}
+			case "compact": {
+				await this.withSessionMutation(request.id, async () => {
+					const result = await runtime.session.compact(request.payload.instructions);
+					this.respond(request.id, safeJson(result));
+				});
+				return;
+			}
+			case "fork": {
+				await this.withSessionMutation(request.id, async () => {
+					const result = await runtime.fork(request.payload.entryId, { position: request.payload.position });
+					if (!result.cancelled) await this.afterSessionReplacement(runtime);
+					this.respond(request.id, {
+						cancelled: result.cancelled,
+						selectedText: result.selectedText ?? null,
+						...this.sessionDto(runtime),
+					});
+				});
+				return;
+			}
+			case "clone": {
+				await this.withSessionMutation(request.id, async () => {
+					const leafId = runtime.session.sessionManager.getLeafId();
+					if (!leafId) return this.reject(request.id, "NOT_FOUND", "Session has no entry to clone");
+					const result = await runtime.fork(leafId, { position: "at" });
+					if (!result.cancelled) await this.afterSessionReplacement(runtime);
+					this.respond(request.id, { cancelled: result.cancelled, ...this.sessionDto(runtime) });
+				});
+				return;
+			}
+			case "tree.get":
+				if (this.sessionMutationPending)
+					return this.reject(request.id, "OPERATION_FAILED", "Session state is being updated");
+				{
+					const tree = sessionTree(runtime);
+					this.respond(request.id, {
+						entries: tree.entries.map((entry) => safeJson(entry)),
+						leafId: tree.leafId,
+					});
+				}
+				return;
+			case "tree.navigate": {
+				await this.withSessionMutation(request.id, async () => {
+					const result = await runtime.session.navigateTree(request.payload.entryId);
+					if (!result.cancelled) this.toolPolicy.bindSessionManager(runtime.session.sessionManager);
+					this.emit({
+						type: "event",
+						event: {
+							type: "state",
+							state: "ready",
+							sessionId: runtime.session.sessionId,
+							...(runtime.session.sessionFile === undefined ? {} : { sessionFile: runtime.session.sessionFile }),
+						},
+					});
+					this.respond(request.id, {
+						cancelled: result.cancelled,
+						...(result.editorText === undefined ? {} : { editorText: redactText(result.editorText) }),
+						...this.sessionDto(runtime),
+						leafId: runtime.session.sessionManager.getLeafId(),
+					});
+				});
+				return;
+			}
+			case "session.import": {
+				await this.withSessionMutation(request.id, async () => {
+					const result = await runtime.importFromJsonl(request.payload.sessionFile, request.payload.cwdOverride);
+					if (!result.cancelled) await this.afterSessionReplacement(runtime);
+					this.respond(request.id, { cancelled: result.cancelled, ...this.sessionDto(runtime) });
+				});
+				return;
+			}
+			case "session.export": {
+				await this.withSessionMutation(request.id, async () => {
+					const path =
+						request.payload.format === "jsonl"
+							? runtime.session.exportToJsonl(request.payload.path)
+							: await runtime.session.exportToHtml(request.payload.path);
+					this.respond(request.id, { path, format: request.payload.format });
+				});
+				return;
+			}
+			case "session.rename":
+				runtime.session.setSessionName(request.payload.title);
+				this.respond(request.id, { renamed: true });
+				return;
 			case "new": {
-				const result = await runtime.newSession({ parentSession: request.payload.parentSession });
-				await this.afterSessionReplacement(runtime);
-				this.respond(request.id, { cancelled: result.cancelled, ...this.sessionDto(runtime) });
+				await this.withSessionMutation(request.id, async () => {
+					const result = await runtime.newSession({ parentSession: request.payload.parentSession });
+					if (!result.cancelled) await this.afterSessionReplacement(runtime);
+					this.respond(request.id, { cancelled: result.cancelled, ...this.sessionDto(runtime) });
+				});
 				return;
 			}
 			case "switch": {
-				const result = await runtime.switchSession(request.payload.sessionFile);
-				await this.afterSessionReplacement(runtime);
-				this.respond(request.id, { cancelled: result.cancelled, ...this.sessionDto(runtime) });
+				await this.withSessionMutation(request.id, async () => {
+					const result = await runtime.switchSession(request.payload.sessionFile);
+					if (!result.cancelled) await this.afterSessionReplacement(runtime);
+					this.respond(request.id, { cancelled: result.cancelled, ...this.sessionDto(runtime) });
+				});
 				return;
 			}
 			case "history":
@@ -589,28 +798,57 @@ export class DesktopWorkerHost {
 				return;
 			}
 			case "model.select": {
+				if (this.providerRefreshPending)
+					return this.reject(request.id, "OPERATION_FAILED", "Provider configuration is being refreshed");
 				const model = runtime.services.modelRuntime.getModel(request.payload.provider, request.payload.modelId);
 				if (!model) return this.reject(request.id, "NOT_FOUND", "Model was not found");
-				await runtime.session.setModel(model, { persist: request.payload.persist });
-				this.respond(request.id, modelDto(runtime.session.model as Model<Api> | undefined));
+				await this.withSessionMutation(request.id, async () => {
+					await runtime.session.setModel(model, { persist: request.payload.persist });
+					this.respond(request.id, modelDto(runtime.session.model as Model<Api> | undefined));
+				});
 				return;
 			}
 			case "auth.refresh": {
-				const provider = request.payload.provider;
-				const result = await runtime.services.modelRuntime.refresh({ providers: [provider], allowNetwork: false });
-				const error = result.errors.get(provider);
-				if (error) throw error;
-				this.respond(request.id, {
-					provider,
-					configured: runtime.services.modelRuntime.hasConfiguredAuth(provider),
-					models: safeJson(runtime.services.modelRuntime.getModels(provider).map((model) => modelDto(model))),
-					availableModels: safeJson(
-						runtime.services.modelRuntime
-							.getAvailableSnapshot()
-							.filter((model) => model.provider === provider)
-							.map((model) => modelDto(model)),
-					),
-				});
+				if (
+					runtime.session.isStreaming ||
+					this.activeRun ||
+					this.providerRefreshPending ||
+					this.sessionMutationPending
+				) {
+					return this.reject(
+						request.id,
+						"OPERATION_FAILED",
+						"Cannot refresh provider configuration while the session is streaming",
+					);
+				}
+				this.providerRefreshPending = true;
+				try {
+					const provider = request.payload.provider;
+					const result = await runtime.services.modelRuntime.refresh({
+						providers: [provider],
+						allowNetwork: false,
+					});
+					const error = result.errors.get(provider);
+					if (error) throw error;
+					const selectedModel = runtime.session.model;
+					if (selectedModel?.provider === provider) {
+						const refreshedModel = runtime.services.modelRuntime.getModel(provider, selectedModel.id);
+						if (refreshedModel) runtime.session.agent.state.model = refreshedModel;
+					}
+					this.respond(request.id, {
+						provider,
+						configured: runtime.services.modelRuntime.hasConfiguredAuth(provider),
+						models: safeJson(runtime.services.modelRuntime.getModels(provider).map((model) => modelDto(model))),
+						availableModels: safeJson(
+							runtime.services.modelRuntime
+								.getAvailableSnapshot()
+								.filter((model) => model.provider === provider)
+								.map((model) => modelDto(model)),
+						),
+					});
+				} finally {
+					this.providerRefreshPending = false;
+				}
 				return;
 			}
 			case "catalog.list": {
@@ -683,6 +921,27 @@ export class DesktopWorkerHost {
 			case "stats.get":
 				this.respond(request.id, safeJson(runtime.session.getSessionStats()));
 				return;
+			case "thinking.get":
+				this.respond(request.id, {
+					level: runtime.session.thinkingLevel,
+					availableLevels: runtime.session.getAvailableThinkingLevels(),
+				});
+				return;
+			case "thinking.set":
+				await this.withSessionMutation(request.id, () => {
+					runtime.session.setThinkingLevel(request.payload.level);
+					this.respond(request.id, {
+						level: runtime.session.thinkingLevel,
+						availableLevels: runtime.session.getAvailableThinkingLevels(),
+					});
+				});
+				return;
+			case "resources.reload":
+				await this.withSessionMutation(request.id, async () => {
+					await runtime.session.reload();
+					this.respond(request.id, { reloaded: true });
+				});
+				return;
 			case "mcp.reload":
 				if (!runtime.session.isIdle) {
 					return this.reject(
@@ -691,8 +950,10 @@ export class DesktopWorkerHost {
 						"Cannot reload MCP servers while the session is streaming",
 					);
 				}
-				await runtime.session.reload();
-				this.respond(request.id, { reloaded: true });
+				await this.withSessionMutation(request.id, async () => {
+					await runtime.session.reload();
+					this.respond(request.id, { reloaded: true });
+				});
 				return;
 			case "mcp.list": {
 				const manager = this.mcpManager;
@@ -752,6 +1013,19 @@ export class DesktopWorkerHost {
 				return this.runMcpAction(request.id, async (manager) => manager.removeServer(request.payload.name));
 			case "abort":
 				this.reject(request.id, "UNSUPPORTED_OPERATION", `Unsupported worker request: ${request.type}`);
+		}
+	}
+
+	private async withSessionMutation(requestId: string, action: () => Promise<void> | void): Promise<void> {
+		if (this.sessionMutationPending || this.providerRefreshPending || this.runtime?.session.isStreaming) {
+			this.reject(requestId, "OPERATION_FAILED", "Wait for the current session operation to finish");
+			return;
+		}
+		this.sessionMutationPending = true;
+		try {
+			await action();
+		} finally {
+			this.sessionMutationPending = false;
 		}
 	}
 
@@ -816,13 +1090,30 @@ export class DesktopWorkerHost {
 		return {
 			sessionId: runtime.session.sessionId,
 			sessionFile: runtime.session.sessionFile ?? null,
+			sessionName: runtime.session.sessionName ?? null,
 			model: modelDto(runtime.session.model as Model<Api> | undefined),
 			messages: sessionMessages(runtime),
+			leafId: runtime.session.sessionManager.getLeafId(),
+			queue: this.queueState(),
+			toolPolicy: this.toolPolicy.getState(),
 		};
+	}
+
+	private queueState(): { steering: string[]; followUp: string[]; pendingCount: number; truncated: boolean } {
+		const session = this.runtime?.session;
+		const steering = typeof session?.getSteeringMessages === "function" ? session.getSteeringMessages() : [];
+		const followUp = typeof session?.getFollowUpMessages === "function" ? session.getFollowUpMessages() : [];
+		const nativePendingCount = session?.pendingMessageCount;
+		const pendingCount =
+			typeof nativePendingCount === "number" && Number.isSafeInteger(nativePendingCount) && nativePendingCount >= 0
+				? nativePendingCount
+				: steering.length + followUp.length;
+		return queuePreview(steering, followUp, pendingCount);
 	}
 
 	private async afterSessionReplacement(runtime: AgentSessionRuntime): Promise<void> {
 		this.unsubscribeSession?.();
+		this.toolPolicy.bindSessionManager(runtime.session.sessionManager);
 		await this.bindDesktopExtensions(runtime);
 		this.unsubscribeSession = runtime.session.subscribe((event) => this.publishSessionEvent(event));
 		const dto = this.sessionDto(runtime);
@@ -839,6 +1130,7 @@ export class DesktopWorkerHost {
 			type: "event",
 			event: { type: "diagnostic", level: "info", message: `Session switched to ${String(dto.sessionId)}` },
 		});
+		this.publishQueueUpdate();
 	}
 
 	private publishRunOutcome(run: PromptRun, error?: string): void {
@@ -860,6 +1152,10 @@ export class DesktopWorkerHost {
 	}
 
 	private publishSessionEvent(event: AgentSessionEvent): void {
+		if (event.type === "queue_update") {
+			this.publishQueueUpdate(event.steering, event.followUp);
+			return;
+		}
 		if (event.type === "message_end" && event.message.role === "assistant" && this.activeRun)
 			this.activeRun.lastAssistant = event.message;
 		if (event.type === "agent_start") {
@@ -922,6 +1218,15 @@ export class DesktopWorkerHost {
 				event: { type: "ui.update", update: "status", key: "session", message: event.name },
 			});
 		}
+	}
+
+	private publishQueueUpdate(steering?: readonly string[], followUp?: readonly string[]): void {
+		const queue =
+			steering && followUp ? queuePreview(steering, followUp, steering.length + followUp.length) : this.queueState();
+		this.emit({
+			type: "event",
+			event: { type: "queue.update", ...queue },
+		});
 	}
 
 	private requestExtensionDialog(

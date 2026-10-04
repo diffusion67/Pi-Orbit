@@ -6,6 +6,7 @@ export type StoredAppEvent = {
 		| "state"
 		| "team"
 		| "message"
+		| "session.queue"
 		| "diagnostic"
 		| "extension.request"
 		| "extension.dismiss"

@@ -7,6 +7,9 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const MAX_GIT_OUTPUT = 32 * 1024 * 1024;
+const MAX_REVIEW_CHANGES = 500;
+const MAX_REVIEW_FILE_DIFF_BYTES = 1024 * 1024;
+const MAX_REVIEW_DIFF_BYTES = 8 * 1024 * 1024;
 
 export type TaskWorktree = {
 	projectRoot: string;
@@ -15,6 +18,16 @@ export type TaskWorktree = {
 };
 
 export type TaskWorktreeChange = { path: string; status: "added" | "modified" | "deleted"; diff: string };
+
+export type ProjectReviewMode = "workingTree" | "baseBranch" | "commit";
+
+export type ProjectReview = {
+	baseCommit: string;
+	changes: readonly TaskWorktreeChange[];
+	truncated: boolean;
+};
+
+type BoundedChanges = { changes: readonly TaskWorktreeChange[]; truncated: boolean };
 
 export type GitMergeBlockReason =
 	| "base-not-ancestor"
@@ -71,6 +84,69 @@ async function gitWithInput(
 			reject(new Error(Buffer.concat(errorParts).toString("utf8").trim() || `git exited with code ${code}`));
 		});
 		child.stdin.end(input);
+	});
+}
+
+async function gitWithInputOutput(cwd: string, args: string[], input: Buffer | string): Promise<string> {
+	return new Promise<string>((resolvePromise, reject) => {
+		const child = spawn("git", ["-C", cwd, ...args], {
+			windowsHide: true,
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		const outputParts: Buffer[] = [];
+		const errorParts: Buffer[] = [];
+		child.stdout.on("data", (chunk: Buffer) => outputParts.push(chunk));
+		child.stderr.on("data", (chunk: Buffer) => errorParts.push(chunk));
+		child.once("error", reject);
+		child.once("close", (code) => {
+			if (code === 0) {
+				resolvePromise(Buffer.concat(outputParts).toString("utf8"));
+				return;
+			}
+			reject(new Error(Buffer.concat(errorParts).toString("utf8").trim() || `git exited with code ${code}`));
+		});
+		child.stdin.end(input);
+	});
+}
+
+async function gitLimitedOutput(
+	cwd: string,
+	args: string[],
+	maxBytes: number,
+	options: { env?: NodeJS.ProcessEnv } = {},
+): Promise<{ output: string; truncated: boolean }> {
+	return new Promise<{ output: string; truncated: boolean }>((resolvePromise, reject) => {
+		const child = spawn("git", ["-C", cwd, ...args], {
+			windowsHide: true,
+			stdio: ["ignore", "pipe", "pipe"],
+			env: options.env,
+		});
+		const outputParts: Buffer[] = [];
+		const errorParts: Buffer[] = [];
+		let outputBytes = 0;
+		let truncated = false;
+		child.stdout.on("data", (chunk: Buffer) => {
+			if (truncated) return;
+			const remaining = maxBytes - outputBytes;
+			if (chunk.length > remaining) {
+				if (remaining > 0) outputParts.push(chunk.subarray(0, remaining));
+				outputBytes += Math.max(0, remaining);
+				truncated = true;
+				child.kill();
+				return;
+			}
+			outputParts.push(chunk);
+			outputBytes += chunk.length;
+		});
+		child.stderr.on("data", (chunk: Buffer) => errorParts.push(chunk));
+		child.once("error", reject);
+		child.once("close", (code) => {
+			if (truncated || code === 0) {
+				resolvePromise({ output: Buffer.concat(outputParts).toString("utf8"), truncated });
+				return;
+			}
+			reject(new Error(Buffer.concat(errorParts).toString("utf8").trim() || `git exited with code ${code}`));
+		});
 	});
 }
 
@@ -217,6 +293,128 @@ async function buildTaskPatch(
 	}
 }
 
+function truncateUtf8(value: string, maxBytes: number): string {
+	let bytes = 0;
+	let end = 0;
+	for (const character of value) {
+		const size = Buffer.byteLength(character, "utf8");
+		if (bytes + size > maxBytes) break;
+		bytes += size;
+		end += character.length;
+	}
+	return end === value.length ? value : value.slice(0, end);
+}
+
+function boundReview(changes: readonly TaskWorktreeChange[], alreadyTruncated = false): BoundedChanges {
+	let truncated = alreadyTruncated || changes.length > MAX_REVIEW_CHANGES;
+	let remainingBytes = MAX_REVIEW_DIFF_BYTES;
+	const bounded = changes.slice(0, MAX_REVIEW_CHANGES).map((change) => {
+		const maxBytes = Math.min(MAX_REVIEW_FILE_DIFF_BYTES, remainingBytes);
+		const diff = truncateUtf8(change.diff, maxBytes);
+		if (diff.length !== change.diff.length) truncated = true;
+		remainingBytes -= Buffer.byteLength(diff, "utf8");
+		return { ...change, diff };
+	});
+	return { changes: bounded, truncated };
+}
+
+async function resolveCommit(projectRoot: string, ref: string): Promise<string> {
+	if (!ref.trim()) throw new TypeError("Git review reference must not be empty");
+	return (await git(projectRoot, ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`])).trim();
+}
+
+async function comparisonChanges(projectRoot: string, baseCommit: string, headCommit: string): Promise<BoundedChanges> {
+	const names = parseNameStatus(
+		await git(projectRoot, ["diff", "--name-status", "-z", "--no-renames", baseCommit, headCommit, "--"]),
+	);
+	const changes: TaskWorktreeChange[] = [];
+	let fileTruncated = false;
+	for (const change of names.slice(0, MAX_REVIEW_CHANGES)) {
+		const result = await gitLimitedOutput(
+			projectRoot,
+			["diff", "--binary", "--no-ext-diff", "--no-renames", baseCommit, headCommit, "--", change.path],
+			MAX_REVIEW_FILE_DIFF_BYTES + 4,
+			{ env: { ...process.env, GIT_LITERAL_PATHSPECS: "1" } },
+		);
+		fileTruncated ||= result.truncated || Buffer.byteLength(result.output, "utf8") > MAX_REVIEW_FILE_DIFF_BYTES;
+		changes.push({
+			path: change.path,
+			status: change.status === "A" ? "added" : change.status === "D" ? "deleted" : "modified",
+			diff: truncateUtf8(result.output, MAX_REVIEW_FILE_DIFF_BYTES),
+		});
+	}
+	return boundReview(changes, fileTruncated || names.length > MAX_REVIEW_CHANGES);
+}
+
+async function workingTreeReviewChanges(projectRoot: string, baseCommit: string): Promise<BoundedChanges> {
+	const trackedChanges = parseNulList(
+		await git(projectRoot, ["diff", "--name-only", "-z", "--no-renames", baseCommit, "--"]),
+	);
+	const untracked = parseNulList(await git(projectRoot, ["ls-files", "--others", "--exclude-standard", "-z"]));
+	const changedPaths = [...new Set([...trackedChanges, ...untracked])];
+	if (changedPaths.length === 0) return boundReview([]);
+
+	const temporaryIndexDirectory = await mkdtemp(join(tmpdir(), "pi-orbit-review-index-"));
+	const indexPath = join(temporaryIndexDirectory, "index");
+	const env = { ...process.env, GIT_INDEX_FILE: indexPath, GIT_LITERAL_PATHSPECS: "1" };
+	try {
+		await git(projectRoot, ["read-tree", baseCommit], { env });
+		const pathInput = Buffer.from(`${changedPaths.join("\0")}\0`, "utf8");
+		await gitWithInput(projectRoot, ["add", "--pathspec-from-file=-", "--pathspec-file-nul"], pathInput, { env });
+		const names = parseNameStatus(
+			await git(projectRoot, ["diff", "--cached", "--name-status", "-z", "--no-renames", baseCommit], { env }),
+		);
+		const changes: TaskWorktreeChange[] = [];
+		let fileTruncated = false;
+		for (const change of names.slice(0, MAX_REVIEW_CHANGES)) {
+			const result = await gitLimitedOutput(
+				projectRoot,
+				["diff", "--cached", "--binary", "--no-ext-diff", "--no-renames", baseCommit, "--", change.path],
+				MAX_REVIEW_FILE_DIFF_BYTES + 4,
+				{ env },
+			);
+			fileTruncated ||= result.truncated || Buffer.byteLength(result.output, "utf8") > MAX_REVIEW_FILE_DIFF_BYTES;
+			changes.push({
+				path: change.path,
+				status: change.status === "A" ? "added" : change.status === "D" ? "deleted" : "modified",
+				diff: truncateUtf8(result.output, MAX_REVIEW_FILE_DIFF_BYTES),
+			});
+		}
+		return boundReview(changes, fileTruncated || names.length > MAX_REVIEW_CHANGES);
+	} finally {
+		await rm(temporaryIndexDirectory, { recursive: true, force: true });
+	}
+}
+
+/** Read project changes relative to HEAD, a merge base, or a commit without changing the index. */
+export async function inspectProjectChanges(options: {
+	projectPath: string;
+	mode?: ProjectReviewMode;
+	ref?: string;
+}): Promise<ProjectReview> {
+	const projectRoot = await repositoryRoot(options.projectPath);
+	const mode = options.mode ?? "workingTree";
+	if (mode === "workingTree") {
+		const baseCommit = await resolveCommit(projectRoot, "HEAD");
+		const bounded = await workingTreeReviewChanges(projectRoot, baseCommit);
+		return { baseCommit, ...bounded };
+	}
+	if (mode !== "baseBranch" && mode !== "commit") throw new TypeError(`Unsupported Git review mode: ${mode}`);
+	if (options.ref === undefined) throw new TypeError(`Git review mode ${mode} requires a reference`);
+	const targetCommit = await resolveCommit(projectRoot, options.ref);
+	if (mode === "baseBranch") {
+		const headCommit = await resolveCommit(projectRoot, "HEAD");
+		const baseCommit = (await git(projectRoot, ["merge-base", targetCommit, headCommit])).trim();
+		const bounded = await comparisonChanges(projectRoot, baseCommit, headCommit);
+		return { baseCommit, ...bounded };
+	}
+	const parents = (await git(projectRoot, ["rev-list", "--parents", "-n", "1", targetCommit])).trim().split(/\s+/);
+	const baseCommit =
+		parents[1] ?? (await gitWithInputOutput(projectRoot, ["hash-object", "-t", "tree", "--stdin"], "")).trim();
+	const bounded = await comparisonChanges(projectRoot, baseCommit, targetCommit);
+	return { baseCommit, ...bounded };
+}
+
 /** Read a child task's complete uncommitted changes without changing either worktree. */
 export async function inspectTaskWorktree(options: {
 	worktreePath: string;
@@ -258,7 +456,6 @@ export async function mergeTaskWorktree(options: {
 
 	const taskId = safeTaskId(options.taskId);
 	const { patch, files, deletions } = await buildTaskPatch(worktreePath, baseCommit);
-	if (patch.length === 0) return { status: "merged", files: [], diff: "" };
 	const patchSha256 = createHash("sha256").update(patch).digest("hex");
 	const markerPath = join(targetCommonDir, "pi-orbit", "merged-tasks", `${taskId}.json`);
 	let marker = await readMergeMarker(markerPath);
@@ -267,12 +464,18 @@ export async function mergeTaskWorktree(options: {
 			return { status: "blocked", reason: "task-id-reused", files, diff: patch };
 		}
 		if (marker.state === "merged") return { status: "already-merged", files, diff: patch };
+		if (patch.length === 0) {
+			marker = { ...marker, state: "merged", updatedAt: new Date().toISOString() };
+			await writeMergeMarker(markerPath, marker);
+			return { status: "already-merged", files, diff: patch };
+		}
 		if (await patchCheck(projectRoot, patch, true)) {
 			marker = { ...marker, state: "merged", updatedAt: new Date().toISOString() };
 			await writeMergeMarker(markerPath, marker);
 			return { status: "already-merged", files, diff: patch };
 		}
 	}
+	if (patch.length === 0) return { status: "merged", files: [], diff: "" };
 
 	const head = (await git(projectRoot, ["rev-parse", "HEAD"])).trim();
 	try {

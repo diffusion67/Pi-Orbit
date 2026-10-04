@@ -3,9 +3,9 @@ import { stripVTControlCharacters } from "node:util";
 
 // Deliberately one release, one repository. Extending this is a separate release review.
 export const REPOSITORY = "diffusion67/Pi-Orbit";
-export const VERSION = "0.1.0-rc.1";
+export const VERSION = "0.1.0-rc.2";
 export const TAG = `pi-orbit-v${VERSION}`;
-export const UPSTREAM_SHA = "7fbbd5f4a1d982bb02d63472dde0774fa639f99b";
+export const UPSTREAM_SHA = "200387122ca450d6387f033949423114a270b96c";
 export const WORKFLOWS = {
 	ci: { name: "CI", path: ".github/workflows/ci.yml" },
 	desktop: { name: "Pi Orbit Desktop Unsigned Artifacts", path: ".github/workflows/desktop-release-candidate.yml" },
@@ -47,6 +47,12 @@ export function assertTrustedRun(run, workflow, sha) {
 	assert.equal(run.name, workflow.name, "Workflow name differs");
 	assert.equal(run.path?.split("@")[0], workflow.path, "Workflow path differs");
 	assert.ok(Number.isSafeInteger(run.run_attempt) && run.run_attempt > 0, "Missing run attempt");
+}
+
+export function assertUpstreamAncestor(sourceSha, upstreamSha, isAncestor) {
+	assert.ok(/^[a-f0-9]{40}$/.test(sourceSha), "Invalid release source SHA");
+	assert.ok(/^[a-f0-9]{40}$/.test(upstreamSha), "Invalid pinned upstream SHA");
+	assert.equal(isAncestor(upstreamSha, sourceSha), true, "Pinned upstream commit is not in the release source history");
 }
 
 function assertJob(jobs, run, name, steps) {

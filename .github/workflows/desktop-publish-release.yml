@@ -11,7 +11,7 @@ permissions: {}
 # Both prerequisite completions can arrive together. Never cancel a job after
 # draft creation, and never run two publishers for the single approved tag.
 concurrency:
-  group: pi-orbit-publish-0.1.0-rc.1
+  group: pi-orbit-publish-0.1.0-rc.2
   cancel-in-progress: false
 
 jobs:
@@ -33,6 +33,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Test publication safety guards

@@ -1,15 +1,16 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type { AuthEvent, AuthInteraction, CredentialStore, MutableModels } from "@earendil-works/pi-ai";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, parseSessionEntries } from "@earendil-works/pi-coding-agent";
 import type { SqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite";
 import { openNodeSqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite/node";
 import {
 	createTaskWorktree,
 	GitWorkspaceDirtyError,
+	inspectProjectChanges,
 	inspectTaskWorktree,
 	mergeTaskWorktree,
 } from "../git/worktrees.ts";
@@ -34,8 +35,13 @@ import type {
 	DesktopResult,
 	DesktopRole,
 	DesktopSession,
+	DesktopSessionPolicy,
+	DesktopSessionQueue,
+	DesktopSessionStats,
+	DesktopSessionTree,
 	DesktopSnapshot,
 	DesktopTask,
+	DesktopThinkingState,
 } from "../shared/desktop-types.ts";
 import { appendTerminalOutput } from "../shared/terminal-output.ts";
 import { isWorkerMainRequest, type WorkerEvent, type WorkerMainRequest } from "../shared/worker-protocol.ts";
@@ -58,7 +64,18 @@ const DEFAULT_SETTINGS: Settings = {
 	defaultModel: "",
 	confirmToolCalls: true,
 	sendShortcut: "enter",
+	subagentsEnabled: false,
+	maxParallelTasks: 4,
 };
+const SESSION_ADMISSION_COMMANDS = new Set<DesktopCommand>([
+	"session.prompt",
+	"settings.save",
+	"provider.save",
+	"provider.remove",
+	"auth.configure",
+	"auth.clear",
+	"auth.logout",
+]);
 
 function validateSessionInput(text: string, attachments: readonly DesktopAttachment[] | undefined): void {
 	if (!text.trim() && (!attachments || attachments.length === 0))
@@ -70,7 +87,15 @@ function validateSessionInput(text: string, attachments: readonly DesktopAttachm
 	}
 }
 
-type WorkerInit = { sessionId: string; sessionFile: string | null; model: unknown; messages: unknown };
+type WorkerInit = {
+	sessionId: string;
+	sessionFile: string | null;
+	sessionName?: string;
+	leafId?: string;
+	model: unknown;
+	messages: unknown;
+	toolPolicy?: DesktopSessionPolicy;
+};
 type WorkerMessage = Extract<WorkerEvent["event"], { type: "message" }>;
 type Listener = (event: DesktopEvent) => void;
 
@@ -86,6 +111,9 @@ export type DesktopAppServiceOptions = {
 	onAuthEvent?: (event: DesktopAuthEvent) => void;
 	onMcpAuthEvent?: (event: DesktopMcpAuthEvent) => void;
 	openExternal?: (url: string) => Promise<void>;
+	chooseProjectDirectory?: (defaultPath?: string) => Promise<string | undefined>;
+	chooseSessionFile?: () => Promise<string | undefined>;
+	chooseSessionExportFile?: (title: string, format: "html" | "jsonl") => Promise<string | undefined>;
 };
 
 type PendingAuthFlow = { readonly controller: AbortController; readonly promptIds: Set<string> };
@@ -191,11 +219,37 @@ function mcpActionResult(value: unknown): { changed?: boolean; reloadRequired?: 
 function workerInit(value: unknown): WorkerInit {
 	const data = record(value);
 	if (!data) throw new DesktopAppError("INVALID_WORKER_RESPONSE", "Worker did not return session details");
+	const policy = record(data.toolPolicy);
 	return {
 		sessionId: requiredString(data.sessionId, "sessionId"),
 		sessionFile: typeof data.sessionFile === "string" ? data.sessionFile : null,
+		...(typeof data.sessionName === "string" ? { sessionName: data.sessionName } : {}),
+		...(typeof data.leafId === "string" ? { leafId: data.leafId } : {}),
 		model: data.model,
 		messages: data.messages,
+		...(policy && (policy.mode === "build" || policy.mode === "plan") && typeof policy.confirmToolCalls === "boolean"
+			? { toolPolicy: { mode: policy.mode, confirmToolCalls: policy.confirmToolCalls } }
+			: {}),
+	};
+}
+
+function sessionQueue(value: unknown): DesktopSessionQueue {
+	const data = record(value);
+	if (
+		!data ||
+		!Array.isArray(data.steering) ||
+		!Array.isArray(data.followUp) ||
+		!data.steering.every((entry) => typeof entry === "string") ||
+		!data.followUp.every((entry) => typeof entry === "string") ||
+		!Number.isSafeInteger(data.pendingCount) ||
+		Number(data.pendingCount) < 0
+	)
+		throw new DesktopAppError("INVALID_WORKER_RESPONSE", "Worker returned an invalid message queue");
+	return {
+		steering: data.steering,
+		followUp: data.followUp,
+		pendingCount: Number(data.pendingCount),
+		...(data.truncated === true ? { truncated: true } : {}),
 	};
 }
 
@@ -235,6 +289,7 @@ function sessionView(session: StoredSession): DesktopSession {
 		updatedAt: session.updatedAt,
 		model: session.model,
 		status: session.status,
+		archived: session.archived === true,
 	};
 }
 
@@ -281,7 +336,16 @@ export class DesktopAppService {
 	private readonly listeners = new Set<Listener>();
 	private readonly taskDetails = new Map<string, TaskDetail>();
 	private readonly taskRunIds = new Map<string, string>();
+	private readonly taskCancellationRequests = new Set<string>();
+	private readonly sessionRunIds = new Map<string, string>();
+	private readonly sessionControlTails = new Map<string, Promise<unknown>>();
+	private readonly sessionWorkerStarts = new Map<string, Promise<void>>();
+	private readonly sessionQueues = new Map<string, DesktopSessionQueue>();
 	private readonly taskControlTails = new Map<string, Promise<unknown>>();
+	private readonly taskScheduleTails = new Map<string, Promise<void>>();
+	private settingsSaveTail: Promise<unknown> = Promise.resolve();
+	private sessionAdmissionTail: Promise<unknown> = Promise.resolve();
+	private taskAdmissionTail: Promise<unknown> = Promise.resolve();
 	private readonly messageIds = new Map<string, string>();
 	private readonly sessionMessageCache = new Map<string, DesktopChatMessage[]>();
 	private readonly extensionUi = new Map<string, DesktopExtensionUiState>();
@@ -292,6 +356,9 @@ export class DesktopAppService {
 	private readonly onAuthEvent?: (event: DesktopAuthEvent) => void;
 	private readonly onMcpAuthEvent?: (event: DesktopMcpAuthEvent) => void;
 	private readonly openExternal?: (url: string) => Promise<void>;
+	private readonly chooseProjectDirectory?: (defaultPath?: string) => Promise<string | undefined>;
+	private readonly chooseSessionFile?: () => Promise<string | undefined>;
+	private readonly chooseSessionExportFile?: (title: string, format: "html" | "jsonl") => Promise<string | undefined>;
 	private readonly rolesById = new Map<string, string>();
 	private activeMessages: DesktopChatMessage[] = [];
 	private providerCache: DesktopProvider[] = [];
@@ -321,6 +388,9 @@ export class DesktopAppService {
 		this.onAuthEvent = options.onAuthEvent;
 		this.onMcpAuthEvent = options.onMcpAuthEvent;
 		this.openExternal = options.openExternal;
+		this.chooseProjectDirectory = options.chooseProjectDirectory;
+		this.chooseSessionFile = options.chooseSessionFile;
+		this.chooseSessionExportFile = options.chooseSessionExportFile;
 		this.events = events;
 		this.workers = new AgentWorkerManager({
 			createProcess: options.createWorkerTransport,
@@ -418,6 +488,10 @@ export class DesktopAppService {
 		await this.workerEventTail;
 		await this.workerUiEventTail;
 		await Promise.allSettled([...this.taskControlTails.values()]);
+		await Promise.allSettled([...this.sessionControlTails.values(), ...this.sessionWorkerStarts.values()]);
+		await Promise.allSettled([this.sessionAdmissionTail, this.taskAdmissionTail]);
+		await Promise.allSettled([...this.taskScheduleTails.values()]);
+		await Promise.allSettled([this.settingsSaveTail]);
 		for (const requestId of [...this.pendingUiRequests.keys()]) await this.dismissPendingUiRequest(requestId);
 		await this.eventPublishTail;
 		await this.team.close();
@@ -507,6 +581,7 @@ export class DesktopAppService {
 			sessions: (await this.registry.listSessions()).map(sessionView),
 			...(activeSessionId === undefined ? {} : { activeSessionId }),
 			messages: this.activeMessages,
+			sessionQueues: Object.fromEntries(this.sessionQueues),
 			tasks: taskSnapshot.tasks.map((task) =>
 				taskView(task, this.rolesById.get(task.roleId) ?? task.roleId, this.taskDetails.get(task.id)),
 			),
@@ -559,12 +634,30 @@ export class DesktopAppService {
 		}
 	}
 
-	private async runCommand(command: DesktopCommand, payload: unknown): Promise<unknown> {
+	private async runCommand(command: DesktopCommand, payload: unknown, admitted = false): Promise<unknown> {
+		if (!admitted && SESSION_ADMISSION_COMMANDS.has(command)) {
+			const operation = this.sessionAdmissionTail
+				.catch(() => {})
+				.then(() => {
+					if (this.closing) throw new DesktopAppError("SHUTTING_DOWN", "Application is closing");
+					return command === "session.prompt" || command === "settings.save"
+						? this.runCommand(command, payload, true)
+						: this.withTaskAdmission(() => this.runCommand(command, payload, true));
+				});
+			this.sessionAdmissionTail = operation;
+			return operation;
+		}
 		switch (command) {
 			case "app.snapshot":
 				return this.snapshot();
 			case "app.quit":
 				return { closing: true };
+			case "project.browse": {
+				if (!this.chooseProjectDirectory)
+					throw new DesktopAppError("DIALOG_UNAVAILABLE", "The native folder picker is unavailable");
+				const input = payload as DesktopCommandPayload<"project.browse">;
+				return { path: (await this.chooseProjectDirectory(input.path)) ?? null };
+			}
 			case "project.open": {
 				const input = payload as DesktopCommandPayload<"project.open">;
 				const previousProjectId = await this.registry.getActiveProjectId();
@@ -584,16 +677,102 @@ export class DesktopAppService {
 				await this.emitSnapshot();
 				return this.projectView(project);
 			}
+			case "project.changes": {
+				const { projectId, mode, ref } = payload as DesktopCommandPayload<"project.changes">;
+				const project = await this.registry.getProject(projectId);
+				if (!project) throw new DesktopAppError("PROJECT_NOT_FOUND", "Unknown project");
+				return inspectProjectChanges({ projectPath: project.path, mode, ref });
+			}
 			case "session.create":
 				return this.createSession(payload as DesktopCommandPayload<"session.create">);
+			case "session.import": {
+				const { projectId } = payload as DesktopCommandPayload<"session.import">;
+				return this.importSession(projectId);
+			}
+			case "session.export": {
+				const { sessionId, format = "html" } = payload as DesktopCommandPayload<"session.export">;
+				const session = await this.requireSession(sessionId);
+				if (!this.chooseSessionExportFile)
+					throw new DesktopAppError("DIALOG_UNAVAILABLE", "The session export picker is unavailable");
+				const path = await this.chooseSessionExportFile(session.title, format);
+				if (!path) return { exported: false };
+				await this.ensureSessionWorker(sessionId);
+				await this.workers.request(`session:${sessionId}`, "session.export", { path, format }, 600_000);
+				return { exported: true, path };
+			}
 			case "session.select":
-				return this.selectSession((payload as DesktopCommandPayload<"session.select">).sessionId);
+				return this.withSessionControl((payload as DesktopCommandPayload<"session.select">).sessionId, () =>
+					this.selectSession((payload as DesktopCommandPayload<"session.select">).sessionId),
+				);
+			case "session.archive":
+			case "session.restore": {
+				const { sessionId } = payload as DesktopCommandPayload<"session.archive">;
+				const archived = command === "session.archive";
+				return this.withSessionControl(sessionId, async () => {
+					const session = await this.requireSession(sessionId);
+					if (archived && session.status === "running")
+						throw new DesktopAppError("SESSION_BUSY", "Wait for the session to finish before archiving it");
+					if (archived) {
+						await this.sessionWorkerStarts.get(sessionId);
+					}
+					const wasActive = (await this.registry.getActiveSessionId()) === sessionId;
+					await this.registry.setSessionArchived(sessionId, archived);
+					if (archived) {
+						this.sessionRunIds.delete(sessionId);
+						this.sessionQueues.delete(sessionId);
+						await this.workers.stop(`session:${sessionId}`);
+					}
+					if (archived && wasActive) {
+						this.activeMessages = [];
+						this.catalogCache = EMPTY_CATALOG;
+					}
+					await this.emitSnapshot();
+					return { archived };
+				});
+			}
+			case "session.policy.get":
+			case "session.policy.set": {
+				const input = payload as DesktopCommandPayload<"session.policy.set">;
+				await this.ensureSessionWorker(input.sessionId);
+				const result = await this.workers.request(
+					`session:${input.sessionId}`,
+					command === "session.policy.get" ? "tool.policy.get" : "tool.policy.set",
+					command === "session.policy.get" ? {} : { mode: input.mode },
+				);
+				if (command === "session.policy.set") {
+					await this.db.run(
+						"INSERT INTO desktop_preferences (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+						`session-tool-mode:${input.sessionId}`,
+						input.mode,
+					);
+				}
+				return result;
+			}
+			case "session.queue.get":
+			case "session.queue.clear": {
+				const { sessionId } = payload as DesktopCommandPayload<"session.queue.get">;
+				await this.ensureSessionWorker(sessionId);
+				const result = sessionQueue(
+					await this.workers.request(
+						`session:${sessionId}`,
+						command === "session.queue.get" ? "queue.get" : "queue.clear",
+						{},
+					),
+				);
+				// Clear returns the removed entries so the renderer can recover them explicitly.
+				if (command === "session.queue.get") this.sessionQueues.set(sessionId, result);
+				else this.sessionQueues.set(sessionId, { steering: [], followUp: [], pendingCount: 0 });
+				await this.emitSnapshot();
+				return result;
+			}
 			case "session.rename": {
 				const input = payload as DesktopCommandPayload<"session.rename">;
 				const title = input.title.trim();
 				if (!title || /[\u0000-\u001f\u007f]/.test(title))
 					throw new DesktopAppError("INVALID_ARGUMENT", "Session names must be 1–200 characters on a single line");
 				await this.requireSession(input.sessionId);
+				await this.ensureSessionWorker(input.sessionId);
+				await this.workers.request(`session:${input.sessionId}`, "session.rename", { title });
 				await this.registry.renameSession(input.sessionId, title);
 				await this.emitSnapshot();
 				return sessionView(await this.requireSession(input.sessionId));
@@ -601,14 +780,29 @@ export class DesktopAppService {
 			case "session.prompt": {
 				const input = payload as DesktopCommandPayload<"session.prompt">;
 				validateSessionInput(input.text, input.attachments);
-				await this.ensureSessionWorker(input.sessionId);
-				await this.workers.request(`session:${input.sessionId}`, "prompt", {
-					text: input.text,
-					...(input.attachments === undefined ? {} : { attachments: input.attachments }),
+				return this.withSessionControl(input.sessionId, async () => {
+					if ((await this.requireSession(input.sessionId)).status === "running")
+						throw new DesktopAppError("SESSION_BUSY", "The session is already running");
+					await this.ensureSessionWorker(input.sessionId);
+					const runId = randomUUID();
+					this.sessionRunIds.set(input.sessionId, runId);
+					await this.setSessionStatus(input.sessionId, "running");
+					try {
+						await this.workers.request(`session:${input.sessionId}`, "prompt", {
+							text: input.text,
+							runId,
+							...(input.attachments === undefined ? {} : { attachments: input.attachments }),
+						});
+					} catch (error) {
+						if (this.sessionRunIds.get(input.sessionId) === runId) {
+							this.sessionRunIds.delete(input.sessionId);
+							await this.setSessionStatus(input.sessionId, "error");
+						}
+						throw error;
+					}
+					await this.emitSnapshot();
+					return { accepted: true };
 				});
-				await this.setSessionStatus(input.sessionId, "running");
-				await this.emitSnapshot();
-				return { accepted: true };
 			}
 			case "session.message": {
 				const input = payload as DesktopCommandPayload<"session.message">;
@@ -617,6 +811,7 @@ export class DesktopAppService {
 					throw new DesktopAppError("SESSION_NOT_RUNNING", "Session must be running to receive a message");
 				return this.workers.request(`session:${input.sessionId}`, "message", {
 					text: input.text,
+					expectedRunId: this.sessionRunIds.get(input.sessionId),
 					deliverAs: input.deliverAs,
 					...(input.attachments === undefined ? {} : { attachments: input.attachments }),
 				});
@@ -629,12 +824,68 @@ export class DesktopAppService {
 			case "session.compact": {
 				const input = payload as DesktopCommandPayload<"session.compact">;
 				await this.ensureSessionWorker(input.sessionId);
-				const result = await this.workers.request(`session:${input.sessionId}`, "compact", {});
+				const result = await this.workers.request(
+					`session:${input.sessionId}`,
+					"compact",
+					{
+						...(input.instructions ? { instructions: input.instructions } : {}),
+					},
+					600_000,
+				);
+				await this.refreshSessionHistory(input.sessionId);
 				await this.emitSnapshot();
 				return { compacted: record(result)?.aborted !== true };
 			}
-			case "session.fork":
-				return this.forkSession((payload as DesktopCommandPayload<"session.fork">).sessionId);
+			case "session.fork": {
+				const { sessionId, entryId, position } = payload as DesktopCommandPayload<"session.fork">;
+				return this.forkSession(sessionId, false, entryId, position);
+			}
+			case "session.clone":
+				return this.forkSession((payload as DesktopCommandPayload<"session.clone">).sessionId, true);
+			case "session.tree": {
+				const { sessionId } = payload as DesktopCommandPayload<"session.tree">;
+				await this.ensureSessionWorker(sessionId);
+				return this.workers.request(`session:${sessionId}`, "tree.get", {}) as Promise<DesktopSessionTree>;
+			}
+			case "session.navigate": {
+				const { sessionId, entryId } = payload as DesktopCommandPayload<"session.navigate">;
+				await this.ensureSessionWorker(sessionId);
+				const result = record(
+					await this.workers.request(`session:${sessionId}`, "tree.navigate", { entryId }, 600_000),
+				);
+				if (result?.cancelled === true) return { navigated: false };
+				await this.refreshSessionHistory(sessionId);
+				await this.emitSnapshot();
+				return {
+					navigated: true,
+					...(typeof result?.editorText === "string" ? { editorText: result.editorText } : {}),
+				};
+			}
+			case "session.stats": {
+				const { sessionId } = payload as DesktopCommandPayload<"session.stats">;
+				await this.ensureSessionWorker(sessionId);
+				return this.workers.request(`session:${sessionId}`, "stats.get", {}) as Promise<DesktopSessionStats>;
+			}
+			case "session.thinking.get": {
+				const { sessionId } = payload as DesktopCommandPayload<"session.thinking.get">;
+				await this.ensureSessionWorker(sessionId);
+				return this.workers.request(`session:${sessionId}`, "thinking.get", {}) as Promise<DesktopThinkingState>;
+			}
+			case "session.thinking.set": {
+				const { sessionId, level } = payload as DesktopCommandPayload<"session.thinking.set">;
+				await this.ensureSessionWorker(sessionId);
+				return this.workers.request(`session:${sessionId}`, "thinking.set", {
+					level,
+				}) as Promise<DesktopThinkingState>;
+			}
+			case "session.reload": {
+				const { sessionId } = payload as DesktopCommandPayload<"session.reload">;
+				await this.ensureSessionWorker(sessionId);
+				await this.workers.request(`session:${sessionId}`, "resources.reload", {}, 600_000);
+				await this.refreshWorkerCatalog(`session:${sessionId}`);
+				await this.emitSnapshot();
+				return { reloaded: true };
+			}
 			case "model.select": {
 				const input = payload as DesktopCommandPayload<"model.select">;
 				await this.ensureSessionWorker(input.sessionId);
@@ -711,6 +962,7 @@ export class DesktopAppService {
 			}
 			case "auth.configure": {
 				const input = payload as DesktopCommandPayload<"auth.configure">;
+				await this.requireIdleProviderWorkers();
 				await this.providerCatalog.configure(input.providerId, input.credential);
 				this.providerCache = await this.providerCatalog.list();
 				const key = await this.activeSessionWorkerKey();
@@ -721,14 +973,30 @@ export class DesktopAppService {
 				await this.emitSnapshot();
 				return { configured: true };
 			}
+			case "provider.save": {
+				const { credential, ...provider } = payload as DesktopCommandPayload<"provider.save">;
+				await this.requireIdleProviderWorkers();
+				await this.providerCatalog.saveCustom(provider, credential);
+				await this.refreshProviderState(provider.id, true);
+				return { saved: true };
+			}
+			case "provider.remove": {
+				const input = payload as DesktopCommandPayload<"provider.remove">;
+				await this.requireIdleProviderWorkers();
+				await this.providerCatalog.removeCustom(input.providerId);
+				await this.refreshProviderState(input.providerId, true);
+				return { removed: true };
+			}
 			case "auth.clear": {
 				const input = payload as DesktopCommandPayload<"auth.clear">;
+				await this.requireIdleProviderWorkers();
 				await this.providerCatalog.clear(input.providerId);
 				await this.refreshProviderState(input.providerId);
 				return { cleared: true };
 			}
 			case "auth.logout": {
 				const input = payload as DesktopCommandPayload<"auth.logout">;
+				await this.requireIdleProviderWorkers();
 				await this.providerCatalog.clear(input.providerId);
 				await this.refreshProviderState(input.providerId);
 				return { cleared: true };
@@ -769,12 +1037,9 @@ export class DesktopAppService {
 			}
 			case "settings.save": {
 				const settings = payload as Settings;
-				await this.db.run(
-					"INSERT INTO desktop_preferences (key, value) VALUES ('settings', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-					JSON.stringify(settings),
-				);
-				await this.emitSnapshot();
-				return settings;
+				const operation = this.settingsSaveTail.catch(() => {}).then(() => this.saveSettings(settings));
+				this.settingsSaveTail = operation;
+				return operation;
 			}
 			case "role.save": {
 				const project = await this.requireActiveProject();
@@ -942,31 +1207,132 @@ export class DesktopAppService {
 	}
 
 	private async selectSession(id: string): Promise<DesktopSession> {
+		if ((await this.requireSession(id)).archived)
+			throw new DesktopAppError("SESSION_ARCHIVED", "Restore the session before selecting it");
 		const session = await this.registry.selectSession(id);
 		const key = `session:${id}`;
 		if (this.workers.has(key)) {
-			const history = workerInit(await this.workers.request(key, "history", {}));
-			if (history.sessionId !== id)
-				throw new DesktopAppError("SESSION_MISMATCH", "Worker belongs to a different session");
-			const restored = this.restoreMessages(history.messages);
-			const priorTools = (this.sessionMessageCache.get(id) ?? []).filter((message) =>
-				message.parts.some((part) => part.kind === "tool"),
-			);
-			const messages = [...restored, ...priorTools];
-			this.sessionMessageCache.set(id, messages);
-			if ((await this.registry.getActiveSessionId()) === id) this.activeMessages = messages;
+			await this.refreshSessionHistory(id, true);
 			await this.refreshWorkerCatalog(key);
 		} else await this.ensureSessionWorker(id);
 		await this.emitSnapshot();
 		return sessionView(session);
 	}
 
-	private async ensureSessionWorker(id: string): Promise<void> {
+	private async importSession(projectId: string): Promise<{ imported: boolean; session?: DesktopSession }> {
+		const project = await this.registry.getProject(projectId);
+		if (!project) throw new DesktopAppError("PROJECT_NOT_FOUND", "Unknown project");
+		if (!this.chooseSessionFile)
+			throw new DesktopAppError("DIALOG_UNAVAILABLE", "The session import picker is unavailable");
+		const sessionFile = await this.chooseSessionFile();
+		if (!sessionFile) return { imported: false };
+		const source = await readFile(sessionFile, "utf8");
+		const header = parseSessionEntries(source).find((entry) => entry.type === "session");
+		if (!header || header.type !== "session")
+			throw new DesktopAppError("INVALID_SESSION", "The selected file has no Pi session header");
+		if (await this.registry.getSession(header.id))
+			throw new DesktopAppError(
+				"SESSION_EXISTS",
+				"This session is already registered. Use Clone session to make another copy.",
+			);
+		const key = `session:${randomUUID()}`;
+		// Pi opens files already in its session directory in place. Stage a private
+		// copy elsewhere so importing always preserves the file the user selected.
+		const stagedFile = join(this.dataDirectory, `import-${randomUUID()}.jsonl`);
+		let imported: WorkerInit;
+		try {
+			await writeFile(stagedFile, source, { encoding: "utf8", flag: "wx", mode: 0o600 });
+			await this.startWorker(key, { cwd: project.path, agentDir: this.agentDirectory });
+			const response = record(
+				await this.workers.request(
+					key,
+					"session.import",
+					{ sessionFile: stagedFile, cwdOverride: project.path },
+					600_000,
+				),
+			);
+			if (response?.cancelled === true) return { imported: false };
+			imported = workerInit(response);
+		} finally {
+			try {
+				await this.workers.stop(key);
+			} finally {
+				await rm(stagedFile, { force: true });
+			}
+		}
+		if (!imported.sessionFile)
+			throw new DesktopAppError("NO_SESSION_FILE", "Imported session has no persistent file");
+		if (await this.registry.getSession(imported.sessionId))
+			throw new DesktopAppError(
+				"SESSION_EXISTS",
+				"This session is already registered. Use Clone session to make another copy.",
+			);
+		const session: StoredSession = {
+			id: imported.sessionId,
+			projectId,
+			file: imported.sessionFile,
+			title: imported.sessionName || "Imported session",
+			updatedAt: new Date().toISOString(),
+			model: modelName(imported.model),
+			status: "idle",
+		};
+		await this.registry.upsertSession(session);
+		await this.selectSession(session.id);
+		return { imported: true, session: sessionView(session) };
+	}
+
+	private async refreshSessionHistory(id: string, preserveLiveTools = false): Promise<void> {
+		const history = workerInit(await this.workers.request(`session:${id}`, "history", {}));
+		if (history.sessionId !== id)
+			throw new DesktopAppError("SESSION_MISMATCH", "Worker belongs to a different session");
+		const restored = this.restoreMessages(history.messages);
+		// Durable entries contain tool calls/results already. Only retain synthetic
+		// live tool events, which have their own IDs and richer execution details.
+		const ids = new Set(restored.map((message) => message.id));
+		const liveTools = preserveLiveTools
+			? (this.sessionMessageCache.get(id) ?? []).filter(
+					(message) => message.id.startsWith("tool:") && !ids.has(message.id),
+				)
+			: [];
+		const messages = [...restored, ...liveTools];
+		this.sessionMessageCache.set(id, messages);
+		if ((await this.registry.getActiveSessionId()) === id) this.activeMessages = messages;
+		const current = await this.requireSession(id);
+		if (history.toolPolicy) {
+			await this.db.run(
+				"INSERT INTO desktop_preferences (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+				`session-tool-mode:${id}`,
+				history.toolPolicy.mode,
+			);
+		}
+		await this.registry.upsertSession({
+			...current,
+			model: modelName(history.model),
+			updatedAt: new Date().toISOString(),
+		});
+	}
+
+	private ensureSessionWorker(id: string): Promise<void> {
+		const pending = this.sessionWorkerStarts.get(id);
+		if (pending) return pending;
+		const operation = this.initializeSessionWorker(id);
+		this.sessionWorkerStarts.set(id, operation);
+		return operation.finally(() => {
+			if (this.sessionWorkerStarts.get(id) === operation) this.sessionWorkerStarts.delete(id);
+		});
+	}
+
+	private async initializeSessionWorker(id: string): Promise<void> {
 		const key = `session:${id}`;
-		if (this.workers.has(key)) return;
 		const session = await this.requireSession(id);
+		if (session.archived) throw new DesktopAppError("SESSION_ARCHIVED", "Restore the session before using it");
+		if (this.workers.has(key)) return;
 		const project = await this.registry.getProject(session.projectId);
 		if (!project) throw new DesktopAppError("PROJECT_NOT_FOUND", "Session project no longer exists");
+		const savedMode = await this.db.get<SettingsRow>(
+			"SELECT value FROM desktop_preferences WHERE key = ?",
+			`session-tool-mode:${id}`,
+		);
 		const init = workerInit(
 			await this.startWorker(key, {
 				cwd: project.path,
@@ -974,7 +1340,8 @@ export class DesktopAppService {
 				sessionFile: session.file,
 				sessionId: session.id,
 				...(session.model ? { model: parseModelName(session.model) } : {}),
-				enableTeamTools: true,
+				enableTeamTools: (await this.readSettings()).subagentsEnabled,
+				...(savedMode?.value === "build" || savedMode?.value === "plan" ? { toolMode: savedMode.value } : {}),
 			}),
 		);
 		if (init.sessionId !== id) {
@@ -997,14 +1364,24 @@ export class DesktopAppService {
 		return this.workers.request(`session:${sessionId}`, type, payload, timeoutMs);
 	}
 
-	private async forkSession(id: string): Promise<DesktopSession> {
+	private async forkSession(
+		id: string,
+		clone = false,
+		entryId?: string,
+		position: "before" | "at" = "at",
+	): Promise<DesktopSession & { selectedText?: string }> {
 		await this.ensureSessionWorker(id);
 		const current = await this.requireSession(id);
 		const history = workerInit(await this.workers.request(`session:${id}`, "history", {}));
-		const lastEntryId = this.restoreMessages(history.messages).at(-1)?.id;
-		if (!lastEntryId) throw new DesktopAppError("NO_FORK_POINT", "The session has no conversation entry to fork");
+		const lastEntryId = entryId ?? history.leafId ?? this.restoreMessages(history.messages).at(-1)?.id;
+		if (!clone && !lastEntryId)
+			throw new DesktopAppError("NO_FORK_POINT", "The session has no conversation entry to fork");
 		const response = record(
-			await this.workers.request(`session:${id}`, "fork", { entryId: lastEntryId, position: "at" }),
+			await this.workers.request(
+				`session:${id}`,
+				clone ? "clone" : "fork",
+				clone ? {} : { entryId: lastEntryId, position },
+			),
 		);
 		if (!response || response.cancelled === true)
 			throw new DesktopAppError("FORK_CANCELLED", "Session fork was cancelled");
@@ -1014,7 +1391,7 @@ export class DesktopAppService {
 			id: sessionId,
 			projectId: current.projectId,
 			file: sessionFile,
-			title: `${current.title} (fork)`,
+			title: `${current.title} (${clone ? "clone" : "fork"})`,
 			updatedAt: new Date().toISOString(),
 			model: modelName(response.model),
 			status: "idle",
@@ -1027,13 +1404,14 @@ export class DesktopAppService {
 		this.activeMessages = [];
 		await this.ensureSessionWorker(sessionId);
 		await this.emitSnapshot();
-		return sessionView(forked);
+		return {
+			...sessionView(forked),
+			...(typeof response.selectedText === "string" ? { selectedText: response.selectedText } : {}),
+		};
 	}
 
 	private async setSessionStatus(id: string, status: StoredSession["status"]): Promise<void> {
-		const current = await this.registry.getSession(id);
-		if (!current) return;
-		await this.registry.upsertSession({ ...current, status, updatedAt: new Date().toISOString() });
+		await this.registry.setSessionStatus(id, status);
 	}
 
 	private async activeSessionWorkerKey(): Promise<string | undefined> {
@@ -1153,13 +1531,34 @@ export class DesktopAppService {
 		this.onAuthEvent?.(event);
 	}
 
-	private async refreshProviderState(providerId: string): Promise<void> {
+	private async requireIdleProviderWorkers(): Promise<void> {
+		const sessions = await this.registry.listSessions();
+		const tasks = (await this.team.snapshot()).tasks;
+		if (sessions.some((session) => session.status === "running") || tasks.some((task) => task.status === "running"))
+			throw new DesktopAppError(
+				"PROVIDER_BUSY",
+				"Wait for running sessions and tasks to finish before changing providers",
+			);
+	}
+
+	private async refreshProviderState(providerId: string, allWorkers = false): Promise<void> {
 		this.providerCache = await this.providerCatalog.list();
-		const key = await this.activeSessionWorkerKey();
-		if (key) {
-			await this.workers.request(key, "auth.refresh", { provider: providerId });
-			await this.refreshWorkerCatalog(key);
+		if (allWorkers) {
+			const settings = await this.readSettings();
+			if (
+				settings.defaultModel.startsWith(`${providerId}/`) &&
+				!this.providerCache.some((provider) => provider.models.includes(settings.defaultModel))
+			)
+				await this.storeSettings({ ...settings, defaultModel: "" });
 		}
+		const key = await this.activeSessionWorkerKey();
+		const keys = allWorkers
+			? [...this.workerGenerations.keys()].filter((workerKey) => this.workers.has(workerKey))
+			: key
+				? [key]
+				: [];
+		for (const workerKey of keys) await this.workers.request(workerKey, "auth.refresh", { provider: providerId });
+		if (key) await this.refreshWorkerCatalog(key);
 		await this.emitSnapshot();
 	}
 
@@ -1248,6 +1647,7 @@ export class DesktopAppService {
 	}
 
 	private async createTask(input: DesktopCommandPayload<"task.create">): Promise<DesktopTask> {
+		await this.requireSubagentsEnabled();
 		const project = await this.registry.getProject(input.projectId);
 		if (!project) throw new DesktopAppError("PROJECT_NOT_FOUND", "Unknown project");
 		const role = (await this.roles.list(project.path)).find((item) => item.id === input.roleId);
@@ -1289,30 +1689,50 @@ export class DesktopAppService {
 		return taskView(await this.requireTask(task.id), role.name, this.taskDetails.get(task.id));
 	}
 
-	private async scheduleTasks(projectId: string): Promise<void> {
+	private scheduleTasks(projectId: string): Promise<void> {
+		const operation = (this.taskScheduleTails.get(projectId) ?? Promise.resolve())
+			.catch(() => {})
+			.then(() => this.runTaskScheduler(projectId));
+		this.taskScheduleTails.set(projectId, operation);
+		return operation.finally(() => {
+			if (this.taskScheduleTails.get(projectId) === operation) this.taskScheduleTails.delete(projectId);
+		});
+	}
+
+	private async runTaskScheduler(projectId: string): Promise<void> {
 		while (!this.closing) {
-			const started = await this.team.startReadyTasks(projectId, 4);
+			const started = await this.withTaskAdmission(async () => {
+				const settings = await this.readSettings();
+				if (this.closing || !settings.subagentsEnabled) return [];
+				return this.team.startReadyTasks(projectId, settings.maxParallelTasks);
+			});
 			await this.publishCommitted();
 			if (started.length === 0) return;
 			let startFailed = false;
-			for (const task of started) {
-				if (this.closing) return;
-				try {
-					await this.startTask(task);
-				} catch (error) {
-					if (this.closing) return;
-					await this.workers.stop(`task:${task.id}`).catch((stopError: unknown) => {
-						this.emitDiagnostic(
-							"TASK_STOP_FAILED",
-							stopError instanceof Error ? stopError.message : String(stopError),
-						);
-					});
-					await this.team.transitionTask(task.id, "failed");
-					await this.publishCommitted();
-					this.emitDiagnostic("TASK_START_FAILED", error instanceof Error ? error.message : String(error));
-					startFailed = true;
-				}
-			}
+			await Promise.all(
+				started.map((task) =>
+					this.withTaskControl(task.id, async () => {
+						if (this.closing) return;
+						if ((await this.team.getTask(task.id))?.status !== "running") return;
+						try {
+							await this.startTask(task);
+						} catch (error) {
+							if (this.closing) return;
+							if (this.taskCancellationRequests.has(task.id)) return;
+							await this.workers.stop(`task:${task.id}`).catch((stopError: unknown) => {
+								this.emitDiagnostic(
+									"TASK_STOP_FAILED",
+									stopError instanceof Error ? stopError.message : String(stopError),
+								);
+							});
+							await this.team.transitionTask(task.id, "failed");
+							await this.publishCommitted();
+							this.emitDiagnostic("TASK_START_FAILED", error instanceof Error ? error.message : String(error));
+							startFailed = true;
+						}
+					}),
+				),
+			);
 			if (!startFailed) return;
 		}
 	}
@@ -1324,6 +1744,7 @@ export class DesktopAppService {
 		if (!role) throw new DesktopAppError("ROLE_NOT_FOUND", "Task role no longer exists");
 		if (this.closing) throw new DesktopAppError("SHUTTING_DOWN", "Application is closing");
 		const key = `task:${task.id}`;
+		if (this.taskCancellationRequests.has(task.id)) throw new DesktopAppError("TASK_CANCELLED", "Task was cancelled");
 		const init = workerInit(
 			await this.startWorker(key, {
 				cwd: task.worktreePath,
@@ -1335,6 +1756,10 @@ export class DesktopAppService {
 			}),
 		);
 		if (init.sessionFile) await this.team.updateTask(task.id, { sessionFile: init.sessionFile });
+		if (this.taskCancellationRequests.has(task.id)) {
+			await this.workers.stop(key);
+			throw new DesktopAppError("TASK_CANCELLED", "Task was cancelled");
+		}
 		await this.publishCommitted();
 		await this.promptTask(task.id, task.sessionFile ? "Continue this task from the last settled step." : task.prompt);
 	}
@@ -1350,7 +1775,15 @@ export class DesktopAppService {
 		if (this.closing) throw new DesktopAppError("SHUTTING_DOWN", "Application is closing");
 		if (this.workerGenerations.get(key) !== generation)
 			throw new WorkerRequestError("ALREADY_RUNNING", `Worker ${key} was replaced while starting`);
-		return this.workers.start(key, payload);
+		const confirmToolCalls = (await this.readSettings()).confirmToolCalls;
+		if (this.closing) throw new DesktopAppError("SHUTTING_DOWN", "Application is closing");
+		if (key.startsWith("task:") && this.taskCancellationRequests.has(key.slice(5)))
+			throw new DesktopAppError("TASK_CANCELLED", "Task was cancelled");
+		const result = await this.workers.start(key, { ...record(payload), confirmToolCalls });
+		const currentConfirmation = (await this.readSettings()).confirmToolCalls;
+		if (currentConfirmation !== confirmToolCalls)
+			await this.workers.request(key, "tool.policy.set", { confirmToolCalls: currentConfirmation });
+		return result;
 	}
 
 	private async promptTask(id: string, text: string): Promise<void> {
@@ -1368,6 +1801,20 @@ export class DesktopAppService {
 		});
 	}
 
+	private withSessionControl<T>(id: string, action: () => Promise<T>): Promise<T> {
+		const operation = (this.sessionControlTails.get(id) ?? Promise.resolve()).catch(() => {}).then(action);
+		this.sessionControlTails.set(id, operation);
+		return operation.finally(() => {
+			if (this.sessionControlTails.get(id) === operation) this.sessionControlTails.delete(id);
+		});
+	}
+
+	private withTaskAdmission<T>(action: () => Promise<T>): Promise<T> {
+		const operation = this.taskAdmissionTail.catch(() => {}).then(action);
+		this.taskAdmissionTail = operation;
+		return operation;
+	}
+
 	private pauseTask(id: string): Promise<DesktopTask> {
 		return this.withTaskControl(id, async () => {
 			const task = await this.team.transitionTask(id, "paused");
@@ -1383,19 +1830,18 @@ export class DesktopAppService {
 
 	private resumeTask(id: string): Promise<DesktopTask> {
 		return this.withTaskControl(id, async () => {
-			const current = await this.requireTask(id);
-			const running = (await this.team.snapshot(current.projectId)).tasks.filter(
-				(task) => task.status === "running",
-			).length;
-			if (running >= 4)
-				throw new DesktopAppError("CONCURRENCY_LIMIT", "Four tasks are already running in this project");
-			const task = await this.team.transitionTask(id, "running");
+			const task = await this.withTaskAdmission(async () => {
+				const settings = await this.requireSubagentsEnabled();
+				if (this.closing) throw new DesktopAppError("SHUTTING_DOWN", "Application is closing");
+				return this.team.transitionTask(id, "running", {}, settings.maxParallelTasks);
+			});
 			await this.publishCommitted();
 			try {
 				if (this.workers.has(`task:${id}`))
 					await this.promptTask(id, "Continue this task from the last settled step.");
 				else await this.startTask(task);
 			} catch (error) {
+				if (this.taskCancellationRequests.has(id)) throw error;
 				await this.workers.stop(`task:${id}`).catch((stopError: unknown) => {
 					this.emitDiagnostic(
 						"TASK_STOP_FAILED",
@@ -1411,17 +1857,40 @@ export class DesktopAppService {
 		});
 	}
 
-	private cancelTask(id: string): Promise<DesktopTask> {
-		return this.withTaskControl(id, async () => {
-			const task = await this.team.transitionTask(id, "cancelled");
-			await this.publishCommitted();
-			try {
+	private async cancelTask(id: string): Promise<DesktopTask> {
+		const current = await this.requireTask(id);
+		if (!["queued", "running", "paused"].includes(current.status))
+			throw new DesktopAppError("TASK_NOT_CANCELLABLE", "Only queued, running or paused tasks can be cancelled");
+		// Publish cancellation intent before waiting for startup's control queue. Stopping
+		// the worker rejects pending init/prompt requests and releases that queue promptly.
+		this.taskCancellationRequests.add(id);
+		try {
+			await this.workers.stop(`task:${id}`).catch((error: unknown) => {
+				this.emitDiagnostic("TASK_STOP_FAILED", error instanceof Error ? error.message : String(error));
+			});
+			return await this.withTaskControl(id, async () => {
 				await this.workers.stop(`task:${id}`);
-			} finally {
+				const task = await this.team.transitionTask(id, "cancelled");
+				this.taskRunIds.delete(id);
+				if (task.worktreePath && task.baseCommit) {
+					try {
+						this.taskDetail(id).changes = [
+							...(await inspectTaskWorktree({ worktreePath: task.worktreePath, baseCommit: task.baseCommit })),
+						];
+					} catch (error) {
+						this.emitDiagnostic("TASK_DIFF_FAILED", error instanceof Error ? error.message : String(error));
+					}
+				}
+				await this.refreshTaskHistory(task);
+				await this.taskDetailStore.save(id, this.taskDetail(id));
+				await this.publishCommitted();
 				await this.scheduleTasks(task.projectId);
-			}
-			return taskView(task, this.rolesById.get(task.roleId) ?? task.roleId, this.taskDetails.get(id));
-		});
+				await this.emitSnapshot();
+				return taskView(task, this.rolesById.get(task.roleId) ?? task.roleId, this.taskDetails.get(id));
+			});
+		} finally {
+			this.taskCancellationRequests.delete(id);
+		}
 	}
 
 	private async mergeTask(id: string): Promise<{ merged: boolean; conflicts: string[] }> {
@@ -1489,6 +1958,7 @@ export class DesktopAppService {
 	}
 
 	private async runMainTeamAction(session: StoredSession, request: WorkerMainRequest): Promise<unknown> {
+		if (request.action === "team.roles" || request.action === "task.create") await this.requireSubagentsEnabled();
 		const project = await this.registry.getProject(session.projectId);
 		if (!project) throw new DesktopAppError("PROJECT_NOT_FOUND", "Session project no longer exists");
 		switch (request.action) {
@@ -1584,19 +2054,42 @@ export class DesktopAppService {
 				this.pendingTaskWaits.add(cancel);
 				timer = setTimeout(() => finish(true), timeoutMs);
 				void this.subscribe(afterSequence, (event) => {
-					if (event.type === "task" && event.task.id === taskId) finish(false);
+					if (
+						event.type === "task" &&
+						event.task.id === taskId &&
+						event.task.status !== "running" &&
+						event.task.status !== "queued"
+					)
+						finish(false);
 				})
-					.then((stop) => {
+					.then(async (stop) => {
 						unsubscribe = stop;
 						if (settled) stop();
+						else {
+							const task = await this.requireTask(taskId);
+							if (task.status !== "running" && task.status !== "queued") finish(false);
+						}
 					})
-					.catch(reject);
+					.catch((error: unknown) => {
+						if (settled) return;
+						settled = true;
+						cleanup();
+						reject(error);
+					});
 			});
 		})();
 	}
 
 	private async handleWorkerEvent(key: string, event: WorkerEvent["event"], generation: string): Promise<void> {
 		if (this.closing || this.workerGenerations.get(key) !== generation) return;
+		if (event.type === "queue.update" && key.startsWith("session:")) {
+			const sessionId = key.slice(8);
+			if ((await this.registry.getSession(sessionId))?.archived) return;
+			const queue = sessionQueue(event);
+			this.sessionQueues.set(sessionId, queue);
+			await this.recordEvent("session.queue", { sessionId, queue });
+			return;
+		}
 		if (event.type === "mcp.status") {
 			const servers = mcpServerViews(event.servers);
 			this.mcpServersByWorker.set(key, servers);
@@ -1682,6 +2175,7 @@ export class DesktopAppService {
 			if (key.startsWith("task:") && (event.state === "idle" || event.state === "failed")) {
 				const id = key.slice(5);
 				await this.withTaskControl(id, async () => {
+					if (this.taskCancellationRequests.has(id)) return;
 					// Both the event and current task status must belong to this run. Pause,
 					// resume and settlement share the same queue so the check stays valid.
 					if (!event.runId || event.runId !== this.taskRunIds.get(id)) return;
@@ -1708,6 +2202,9 @@ export class DesktopAppService {
 					await this.team.transitionTask(id, status);
 					this.taskRunIds.delete(id);
 					await this.publishCommitted();
+					await this.workers.stop(key).catch((error: unknown) => {
+						this.emitDiagnostic("TASK_STOP_FAILED", error instanceof Error ? error.message : String(error));
+					});
 					await this.emitSnapshot();
 					await this.scheduleTasks(task.projectId);
 				});
@@ -1715,9 +2212,12 @@ export class DesktopAppService {
 			}
 			if (key.startsWith("session:")) {
 				const id = key.slice(8);
+				const currentRun = this.sessionRunIds.get(id);
+				if ((event.runId && event.runId !== currentRun) || (currentRun && event.runId !== currentRun)) return;
 				if (event.state === "streaming") await this.setSessionStatus(id, "running");
 				if (event.state === "idle") await this.setSessionStatus(id, "idle");
 				if (event.state === "failed") await this.setSessionStatus(id, "error");
+				if (event.state === "idle" || event.state === "failed") this.sessionRunIds.delete(id);
 				if (event.state === "streaming" || event.state === "idle" || event.state === "failed")
 					await this.emitSnapshot();
 			}
@@ -1891,6 +2391,8 @@ export class DesktopAppService {
 		this.mcpServersByWorker.delete(key);
 		await this.recordEvent("mcp.status", { workerKey: key, servers: [] });
 		if (key.startsWith("session:")) {
+			this.sessionRunIds.delete(key.slice(8));
+			this.sessionQueues.delete(key.slice(8));
 			await this.setSessionStatus(key.slice(8), "error");
 			await this.emitSnapshot();
 		} else if (key.startsWith("task:")) {
@@ -1943,10 +2445,91 @@ export class DesktopAppService {
 				defaultModel: typeof saved.defaultModel === "string" ? saved.defaultModel : "",
 				confirmToolCalls: typeof saved.confirmToolCalls === "boolean" ? saved.confirmToolCalls : true,
 				sendShortcut: saved.sendShortcut === "ctrlEnter" ? "ctrlEnter" : "enter",
+				subagentsEnabled: saved.subagentsEnabled === true,
+				maxParallelTasks:
+					typeof saved.maxParallelTasks === "number" &&
+					Number.isInteger(saved.maxParallelTasks) &&
+					saved.maxParallelTasks >= 1 &&
+					saved.maxParallelTasks <= 4
+						? saved.maxParallelTasks
+						: 4,
 			};
 		} catch {
 			return { ...DEFAULT_SETTINGS };
 		}
+	}
+
+	private async requireSubagentsEnabled(): Promise<Settings> {
+		const settings = await this.readSettings();
+		if (!settings.subagentsEnabled)
+			throw new DesktopAppError(
+				"SUBAGENTS_DISABLED",
+				"Enable subagents in Settings before creating or resuming tasks",
+			);
+		return settings;
+	}
+
+	private async saveSettings(settings: Settings): Promise<Settings> {
+		const previous = await this.readSettings();
+		const changed = previous.subagentsEnabled !== settings.subagentsEnabled;
+		if (changed) {
+			if ((await this.registry.listSessions()).some((session) => session.status === "running"))
+				throw new DesktopAppError(
+					"SESSION_BUSY",
+					"Wait for running sessions to finish before changing subagent settings",
+				);
+			// Recreate idle main sessions so both the model's tool list and the
+			// runtime tool registry reflect the setting immediately.
+			for (const key of this.workerGenerations.keys())
+				if (key.startsWith("session:") && this.workers.has(key)) await this.workers.stop(key);
+		}
+		await this.withTaskAdmission(() => this.storeSettings(settings));
+		if (previous.confirmToolCalls !== settings.confirmToolCalls) {
+			const policyUpdates = await Promise.allSettled(
+				[...this.workerGenerations.keys()]
+					.filter((key) => this.workers.has(key))
+					.map((key) =>
+						this.workers.request(key, "tool.policy.set", { confirmToolCalls: settings.confirmToolCalls }),
+					),
+			);
+			const failure = policyUpdates.find((update) => update.status === "rejected");
+			if (failure?.status === "rejected") {
+				await this.withTaskAdmission(() => this.storeSettings(previous));
+				await Promise.allSettled(
+					[...this.workerGenerations.keys()]
+						.filter((key) => this.workers.has(key))
+						.map((key) =>
+							this.workers.request(key, "tool.policy.set", { confirmToolCalls: previous.confirmToolCalls }),
+						),
+				);
+				throw failure.reason;
+			}
+		}
+		if (changed) {
+			const activeId = await this.registry.getActiveSessionId();
+			if (activeId) {
+				try {
+					await this.ensureSessionWorker(activeId);
+				} catch (error) {
+					this.emitDiagnostic("SESSION_RESTART_FAILED", error instanceof Error ? error.message : String(error));
+				}
+			}
+		}
+		if (
+			settings.subagentsEnabled &&
+			(!previous.subagentsEnabled || settings.maxParallelTasks > previous.maxParallelTasks)
+		) {
+			for (const project of await this.registry.listProjects()) await this.scheduleTasks(project.id);
+		}
+		await this.emitSnapshot();
+		return settings;
+	}
+
+	private async storeSettings(settings: Settings): Promise<void> {
+		await this.db.run(
+			"INSERT INTO desktop_preferences (key, value) VALUES ('settings', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+			JSON.stringify(settings),
+		);
 	}
 
 	private async emitSnapshot(): Promise<void> {
@@ -1990,6 +2573,14 @@ export class DesktopAppService {
 		}
 		if (stored.kind === "message" && record(payload?.message)) {
 			return { seq: stored.seq, type: "message", message: payload?.message as DesktopChatMessage };
+		}
+		if (stored.kind === "session.queue" && typeof payload?.sessionId === "string") {
+			return {
+				seq: stored.seq,
+				type: "session.queue",
+				sessionId: payload.sessionId,
+				queue: sessionQueue(payload.queue),
+			};
 		}
 		if (stored.kind === "state" && record(payload?.snapshot)) {
 			return {
