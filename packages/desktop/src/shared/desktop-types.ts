@@ -11,6 +11,33 @@ export type DesktopSession = {
 	updatedAt: string;
 	model: string;
 	status: "idle" | "running" | "error";
+	archived: boolean;
+};
+export type DesktopSessionQueue = { steering: string[]; followUp: string[]; pendingCount: number; truncated?: boolean };
+export type DesktopSessionPolicy = { confirmToolCalls: boolean; mode: "build" | "plan" };
+export type DesktopThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export type DesktopThinkingState = { level: DesktopThinkingLevel; availableLevels: DesktopThinkingLevel[] };
+export type DesktopSessionTree = {
+	entries: Array<{
+		id: string;
+		parentId: string | null;
+		type: string;
+		label: string;
+		role?: string;
+		timestamp?: number;
+	}>;
+	leafId: string | null;
+};
+export type DesktopSessionStats = {
+	sessionId: string;
+	sessionFile?: string;
+	userMessages: number;
+	assistantMessages: number;
+	toolCalls: number;
+	toolResults: number;
+	totalMessages: number;
+	tokens: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+	cost: number;
 };
 export type DesktopChatPart =
 	| { kind: "text"; text: string }
@@ -55,6 +82,27 @@ export type DesktopRole = {
 	scope: "user" | "project";
 };
 export type DesktopCatalogEntry = { id: string; name: string; description: string; source: string; enabled: boolean };
+export type DesktopProviderApi =
+	| "anthropic-messages"
+	| "openai-completions"
+	| "openai-responses"
+	| "openai-codex-responses";
+export type DesktopCustomModel = {
+	id: string;
+	name: string;
+	reasoning: boolean;
+	input: ("text" | "image")[];
+	contextWindow: number;
+	maxTokens: number;
+};
+/** Only public connection metadata crosses back to the renderer. */
+export type DesktopCustomProvider = {
+	id: string;
+	name: string;
+	api: DesktopProviderApi;
+	baseUrl: string;
+	models: DesktopCustomModel[];
+};
 export type DesktopProvider = {
 	id: string;
 	name: string;
@@ -63,6 +111,7 @@ export type DesktopProvider = {
 	apiKeyLogin: boolean;
 	oauthLogin: boolean;
 	models: string[];
+	custom?: DesktopCustomProvider;
 };
 export type DesktopMcpServer = {
 	name: string;
@@ -90,6 +139,7 @@ export type DesktopSnapshot = {
 	activeProjectId?: string;
 	sessions: DesktopSession[];
 	activeSessionId?: string;
+	sessionQueues?: Record<string, DesktopSessionQueue>;
 	messages: DesktopChatMessage[];
 	tasks: DesktopTask[];
 	roles: DesktopRole[];
@@ -108,6 +158,8 @@ export type DesktopSnapshot = {
 		defaultModel: string;
 		confirmToolCalls: boolean;
 		sendShortcut: "enter" | "ctrlEnter";
+		subagentsEnabled: boolean;
+		maxParallelTasks: number;
 	};
 	features: { terminal: boolean; desktopExtensions: boolean };
 	terminal?: {
@@ -123,6 +175,7 @@ export type DesktopEvent =
 	| { seq: number; type: "snapshot"; snapshot: DesktopSnapshot }
 	| { seq: number; type: "message"; message: DesktopChatMessage }
 	| { seq: number; type: "task"; task: DesktopTask }
+	| { seq: number; type: "session.queue"; sessionId: string; queue: DesktopSessionQueue }
 	| { seq: number; type: "diagnostic"; code: string; message: string }
 	| {
 			seq: number;

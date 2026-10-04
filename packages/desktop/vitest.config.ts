@@ -11,6 +11,7 @@ export default mergeConfig(
 				"test/extensions/desktop-ui-context.test.ts",
 				"test/git/worktrees.test.ts",
 				"test/main/app-service.test.ts",
+				"test/main/codex-adaptations.test.ts",
 				"test/main/session-message.test.ts",
 				"test/main/worker-ui-dismiss.test.ts",
 			],

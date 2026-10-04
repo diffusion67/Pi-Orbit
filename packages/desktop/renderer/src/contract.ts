@@ -1,13 +1,18 @@
 import type { JsonValue } from "@earendil-works/chord";
 import type { DesktopAttachment } from "../../src/shared/attachments.ts";
-import type { DesktopAuthEvent, DesktopMcpAuthEvent, DesktopMcpServer } from "../../src/shared/desktop-types.ts";
+import type { DesktopAuthEvent, DesktopCustomProvider, DesktopMcpAuthEvent, DesktopMcpServer, DesktopProvider, DesktopSessionPolicy, DesktopSessionQueue, DesktopSessionStats, DesktopSessionTree, DesktopThinkingLevel, DesktopThinkingState } from "../../src/shared/desktop-types.ts";
 
 export type { DesktopAttachment };
+export type { DesktopCustomModel, DesktopCustomProvider, DesktopProviderApi } from "../../src/shared/desktop-types.ts";
+export type { DesktopSessionPolicy, DesktopSessionQueue, DesktopSessionStats, DesktopSessionTree, DesktopThinkingState, DesktopThinkingLevel } from "../../src/shared/desktop-types.ts";
 
 export type Result<T> = { ok: true; data: T } | { ok: false; code: string; message: string };
 
 export type Project = { id: string; name: string; path: string; branch: string; dirty: boolean };
-export type Session = { id: string; projectId: string; title: string; updatedAt: string; model: string; status: "idle" | "running" | "error" };
+export type Session = { id: string; projectId: string; title: string; updatedAt: string; model: string; status: "idle" | "running" | "error"; archived: boolean };
+export type ProjectChange = { path: string; status: "added" | "modified" | "deleted"; diff: string };
+export type ProjectChangeMode = "workingTree" | "baseBranch" | "commit";
+export type ProjectChanges = { baseCommit: string; changes: ProjectChange[]; truncated: boolean };
 export type ChatPart =
 	| { kind: "text"; text: string }
 	| { kind: "image"; mimeType: string }
@@ -38,15 +43,7 @@ export type Task = {
 };
 export type Role = { id: string; name: string; description: string; systemPrompt: string; model: string; tools: string[]; scope: "user" | "project" };
 export type CatalogEntry = { id: string; name: string; description: string; source: string; enabled: boolean };
-export type Provider = {
-	id: string;
-	name: string;
-	configured: boolean;
-	credentialType?: "api_key" | "oauth";
-	apiKeyLogin: boolean;
-	oauthLogin: boolean;
-	models: string[];
-};
+export type Provider = DesktopProvider;
 export type McpServer = DesktopMcpServer;
 export type ExtensionUiState = {
 	status: Record<string, string>;
@@ -64,6 +61,7 @@ export type AppSnapshot = {
 	activeProjectId?: string;
 	sessions: Session[];
 	activeSessionId?: string;
+	sessionQueues?: Record<string, DesktopSessionQueue>;
 	messages: ChatMessage[];
 	tasks: Task[];
 	roles: Role[];
@@ -77,6 +75,8 @@ export type AppSnapshot = {
 		defaultModel: string;
 		confirmToolCalls: boolean;
 		sendShortcut: "enter" | "ctrlEnter";
+		subagentsEnabled: boolean;
+		maxParallelTasks: number;
 	};
 	features: { terminal: boolean; desktopExtensions: boolean };
 	terminal?: { id: string; title: string; state: "starting" | "running" | "exited"; output: string; outputOffset?: number };
@@ -86,6 +86,7 @@ export type DesktopEvent =
 	| { seq: number; type: "snapshot"; snapshot: AppSnapshot }
 	| { seq: number; type: "message"; message: ChatMessage }
 	| { seq: number; type: "task"; task: Task }
+	| { seq: number; type: "session.queue"; sessionId: string; queue: DesktopSessionQueue }
 	| { seq: number; type: "diagnostic"; code: string; message: string }
 	| { seq: number; type: "extension.request"; request: { id: string; extensionId: string; title: string; message?: string; kind: "text" | "confirm" | "select" | "editor"; options?: string[]; placeholder?: string } }
 	| { seq: number; type: "extension.update"; workerKey: string; state: ExtensionUiState }
@@ -100,15 +101,32 @@ export type CommandMap = {
 	"app.snapshot": { payload: undefined; data: AppSnapshot };
 	"app.quit": { payload: undefined; data: { closing: true } };
 	"project.open": { payload: { path: string }; data: Project };
+	"project.browse": { payload: { path?: string }; data: { path: string | null } };
 	"project.create": { payload: { path: string; name: string }; data: Project };
+	"project.changes": { payload: { projectId: string; mode?: ProjectChangeMode; ref?: string }; data: ProjectChanges };
 	"session.select": { payload: { sessionId: string }; data: Session };
+	"session.archive": { payload: { sessionId: string }; data: { archived: true } };
+	"session.restore": { payload: { sessionId: string }; data: { archived: false } };
+	"session.policy.get": { payload: { sessionId: string }; data: DesktopSessionPolicy };
+	"session.policy.set": { payload: { sessionId: string; mode: DesktopSessionPolicy["mode"] }; data: DesktopSessionPolicy };
+	"session.queue.get": { payload: { sessionId: string }; data: DesktopSessionQueue };
+	"session.queue.clear": { payload: { sessionId: string }; data: DesktopSessionQueue };
 	"session.rename": { payload: { sessionId: string; title: string }; data: Session };
 	"session.create": { payload: { projectId: string; model?: string }; data: Session };
+	"session.import": { payload: { projectId: string }; data: { imported: boolean; session?: Session } };
+	"session.export": { payload: { sessionId: string; format?: "html" | "jsonl" }; data: { exported: boolean; path?: string } };
 	"session.prompt": { payload: { sessionId: string; text: string; attachments?: DesktopAttachment[] }; data: { accepted: true } };
 	"session.message": { payload: { sessionId: string; text: string; deliverAs: "steer" | "followUp"; attachments?: DesktopAttachment[] }; data: { accepted: true; delivery: "steer" | "followUp" } };
 	"session.abort": { payload: { sessionId: string }; data: { aborted: boolean } };
-	"session.fork": { payload: { sessionId: string }; data: Session };
-	"session.compact": { payload: { sessionId: string }; data: { compacted: boolean } };
+	"session.fork": { payload: { sessionId: string; entryId?: string; position?: "before" | "at" }; data: Session & { selectedText?: string } };
+	"session.clone": { payload: { sessionId: string }; data: Session };
+	"session.tree": { payload: { sessionId: string }; data: DesktopSessionTree };
+	"session.navigate": { payload: { sessionId: string; entryId: string }; data: { navigated: boolean; editorText?: string } };
+	"session.stats": { payload: { sessionId: string }; data: DesktopSessionStats };
+	"session.thinking.get": { payload: { sessionId: string }; data: DesktopThinkingState };
+	"session.thinking.set": { payload: { sessionId: string; level: DesktopThinkingLevel }; data: DesktopThinkingState };
+	"session.reload": { payload: { sessionId: string }; data: { reloaded: true } };
+	"session.compact": { payload: { sessionId: string; instructions?: string }; data: { compacted: boolean } };
 	"model.select": { payload: { sessionId: string; model: string }; data: { model: string } };
 	"mcp.list": { payload: { sessionId: string }; data: McpServer[] };
 	"mcp.sign-in": { payload: { sessionId: string; name: string }; data: { changed?: boolean; reloadRequired?: boolean } };
@@ -121,6 +139,8 @@ export type CommandMap = {
 	"mcp.remove": { payload: { sessionId: string; name: string }; data: { changed?: boolean; reloadRequired?: boolean } };
 	"mcp.reload": { payload: { sessionId: string }; data: { reloaded: true } };
 	"auth.configure": { payload: { providerId: string; credential: string }; data: { configured: true } };
+	"provider.save": { payload: DesktopCustomProvider & { credential?: string }; data: { saved: true } };
+	"provider.remove": { payload: { providerId: string }; data: { removed: true } };
 	"auth.clear": { payload: { providerId: string }; data: { cleared: true } };
 	"auth.login": { payload: { providerId: string }; data: { flowId: string } };
 	"auth.logout": { payload: { providerId: string }; data: { cleared: true } };

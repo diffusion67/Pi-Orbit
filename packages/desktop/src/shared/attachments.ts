@@ -1,4 +1,3 @@
-import type { ImageContent } from "@earendil-works/pi-ai";
 import Type from "typebox";
 
 export const MAX_ATTACHMENT_COUNT = 5;
@@ -108,7 +107,7 @@ function attachmentByteLength(attachment: DesktopAttachment): number {
 	return base64ByteLength(attachment.data);
 }
 
-export function imageContentFromAttachments(attachments: readonly DesktopAttachment[] | undefined): ImageContent[] {
+export function imageContentFromAttachments(attachments: readonly DesktopAttachment[] | undefined) {
 	return (attachments ?? []).flatMap((attachment) =>
 		attachment.type === "image"
 			? [{ type: "image" as const, data: attachment.data, mimeType: attachment.mimeType }]

@@ -30,6 +30,7 @@ const mcpOAuthConfig = strict({
 	callbackUrl: Type.Optional(Type.String({ maxLength: 10_000 })),
 	scope: Type.Optional(Type.String({ maxLength: 10_000 })),
 	clientName: Type.Optional(Type.String({ maxLength: 10_000 })),
+	clientRegistration: Type.Optional(Type.Union([Type.Literal("dcr"), Type.Literal("cimd")])),
 	authServerMetadataUrl: Type.Optional(Type.String({ maxLength: 10_000 })),
 });
 const mcpServerConfig = Type.Union([
@@ -83,6 +84,8 @@ const initPayload = strict({
 	tools: Type.Optional(Type.Array(text(128), { maxItems: 128 })),
 	systemPrompt: Type.Optional(Type.String({ maxLength: 100_000 })),
 	enableTeamTools: Type.Optional(Type.Boolean()),
+	confirmToolCalls: Type.Optional(Type.Boolean()),
+	toolMode: Type.Optional(Type.Union([Type.Literal("build"), Type.Literal("plan")])),
 });
 
 export const WorkerRequestSchema = Type.Union([
@@ -102,7 +105,19 @@ export const WorkerRequestSchema = Type.Union([
 		payload: strict({
 			text: Type.String({ maxLength: 100_000 }),
 			deliverAs: Type.Union([Type.Literal("steer"), Type.Literal("followUp")]),
+			expectedRunId: Type.Optional(text(128)),
 			attachments: Type.Optional(Type.Array(DesktopAttachmentSchema, { maxItems: MAX_ATTACHMENT_COUNT })),
+		}),
+	}),
+	strict({ id: text(128), type: Type.Literal("queue.get"), payload: strict({}) }),
+	strict({ id: text(128), type: Type.Literal("queue.clear"), payload: strict({}) }),
+	strict({ id: text(128), type: Type.Literal("tool.policy.get"), payload: strict({}) }),
+	strict({
+		id: text(128),
+		type: Type.Literal("tool.policy.set"),
+		payload: strict({
+			confirmToolCalls: Type.Optional(Type.Boolean()),
+			mode: Type.Optional(Type.Union([Type.Literal("build"), Type.Literal("plan")])),
 		}),
 	}),
 	strict({ id: text(128), type: Type.Literal("abort"), payload: Type.Optional(strict({})) }),
@@ -126,6 +141,24 @@ export const WorkerRequestSchema = Type.Union([
 	}),
 	strict({ id: text(128), type: Type.Literal("switch"), payload: strict({ sessionFile: text(32_768) }) }),
 	strict({ id: text(128), type: Type.Literal("history"), payload: Type.Optional(strict({})) }),
+	strict({
+		id: text(128),
+		type: Type.Literal("session.rename"),
+		payload: strict({ title: Type.String({ minLength: 1, maxLength: 200 }) }),
+	}),
+	strict({ id: text(128), type: Type.Literal("clone"), payload: strict({}) }),
+	strict({ id: text(128), type: Type.Literal("tree.get"), payload: strict({}) }),
+	strict({ id: text(128), type: Type.Literal("tree.navigate"), payload: strict({ entryId: text(512) }) }),
+	strict({
+		id: text(128),
+		type: Type.Literal("session.import"),
+		payload: strict({ sessionFile: text(32_768), cwdOverride: Type.Optional(text(32_768)) }),
+	}),
+	strict({
+		id: text(128),
+		type: Type.Literal("session.export"),
+		payload: strict({ path: text(32_768), format: Type.Union([Type.Literal("html"), Type.Literal("jsonl")]) }),
+	}),
 	strict({
 		id: text(128),
 		type: Type.Literal("main.resolve"),
@@ -190,6 +223,23 @@ export const WorkerRequestSchema = Type.Union([
 		}),
 	}),
 	strict({ id: text(128), type: Type.Literal("stats.get"), payload: Type.Optional(strict({})) }),
+	strict({ id: text(128), type: Type.Literal("thinking.get"), payload: strict({}) }),
+	strict({
+		id: text(128),
+		type: Type.Literal("thinking.set"),
+		payload: strict({
+			level: Type.Union([
+				Type.Literal("off"),
+				Type.Literal("minimal"),
+				Type.Literal("low"),
+				Type.Literal("medium"),
+				Type.Literal("high"),
+				Type.Literal("xhigh"),
+				Type.Literal("max"),
+			]),
+		}),
+	}),
+	strict({ id: text(128), type: Type.Literal("resources.reload"), payload: strict({}) }),
 	strict({ id: text(128), type: Type.Literal("mcp.list"), payload: Type.Optional(strict({})) }),
 	strict({ id: text(128), type: Type.Literal("mcp.reload"), payload: Type.Optional(strict({})) }),
 	strict({ id: text(128), type: Type.Literal("mcp.sign-in"), payload: strict({ name: mcpName }) }),
@@ -273,6 +323,16 @@ export type WorkerEvent =
 				readonly parts?: readonly JsonValue[];
 				readonly timestamp?: number;
 				readonly entryId?: string;
+			};
+	  }
+	| {
+			readonly type: "event";
+			readonly event: {
+				readonly type: "queue.update";
+				readonly steering: readonly string[];
+				readonly followUp: readonly string[];
+				readonly pendingCount: number;
+				readonly truncated: boolean;
 			};
 	  }
 	| {

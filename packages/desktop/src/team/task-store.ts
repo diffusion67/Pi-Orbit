@@ -189,9 +189,17 @@ export class TeamTaskStore {
 		});
 	}
 
-	async transitionTask(id: string, status: TeamTaskStatus, patch: TeamTaskPatch = {}): Promise<TeamTaskRecord> {
+	async transitionTask(
+		id: string,
+		status: TeamTaskStatus,
+		patch: TeamTaskPatch = {},
+		runningLimit = 4,
+	): Promise<TeamTaskRecord> {
 		this.assertOpen();
 		if (!statuses.has(status)) throw new Error(`Unknown task status: ${status}`);
+		if (status === "running" && (!Number.isInteger(runningLimit) || runningLimit < 1)) {
+			throw new RangeError("Task concurrency limit must be a positive integer");
+		}
 		return this.db.transaction(async (tx) => {
 			const current = await this.readTask(tx, id);
 			if (current === undefined) throw new TeamTaskError("TASK_NOT_FOUND", `Task ${id} does not exist`);
@@ -201,17 +209,17 @@ export class TeamTaskStore {
 					`Cannot change task ${id} from ${current.status} to ${status}`,
 				);
 			}
-			if (status === "running" && (current.status === "paused" || current.status === "review")) {
+			if (status === "running") {
 				if (!(await this.dependenciesSucceeded(tx, current))) {
-					throw new Error(`Task ${id} cannot resume before its dependencies complete`);
+					throw new Error(`Task ${id} cannot run before its dependencies complete`);
 				}
 				const runningCount = (await this.readProjectTasks(tx, current.projectId)).filter(
 					(task) => task.status === "running",
 				).length;
-				if (runningCount >= 4) {
+				if (runningCount >= runningLimit) {
 					throw new TeamTaskError(
 						"CONCURRENCY_LIMIT",
-						`Project ${current.projectId} already has four running tasks`,
+						`Project ${current.projectId} already has ${runningLimit} running tasks`,
 					);
 				}
 			}

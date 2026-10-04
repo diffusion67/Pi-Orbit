@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime, ExtensionUIContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { type McpManagerHandle, type McpSignInPrompt, SessionManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
@@ -332,7 +333,7 @@ describe("desktop worker protocol and credentials", () => {
 		await host.close();
 	});
 
-	it("returns from prompt and queues steering and follow-up while the Pi session is running", async () => {
+	it("queues steering and follow-up through Pi, bounds previews, and acknowledges applied messages after settlement", async () => {
 		const sent: unknown[] = [];
 		const listeners = new Set<(value: unknown) => void>();
 		const port: DesktopWorkerPort = {
@@ -347,9 +348,15 @@ describe("desktop worker protocol and credentials", () => {
 			},
 		};
 		let rejectPrompt: ((error: Error) => void) | undefined;
+		let resolveDelayedSteer: (() => void) | undefined;
 		let isStreaming = false;
 		const promptOptions: unknown[] = [];
 		const promptTexts: string[] = [];
+		const steering: string[] = [];
+		const followUp: string[] = [];
+		const steeringCalls: string[] = [];
+		const sessionEntries: Array<{ type: "custom"; customType: string; data: unknown }> = [];
+		let sessionListener: ((event: unknown) => void) | undefined;
 		const fakeRuntime = {
 			diagnostics: [],
 			session: {
@@ -359,15 +366,53 @@ describe("desktop worker protocol and credentials", () => {
 				get isStreaming() {
 					return isStreaming;
 				},
-				sessionManager: { getBranch: () => [] },
+				get isIdle() {
+					return !isStreaming;
+				},
+				sessionManager: {
+					getBranch: () => sessionEntries,
+					appendCustomEntry: (customType: string, data: unknown) => {
+						sessionEntries.push({ type: "custom", customType, data });
+						return `entry-${sessionEntries.length}`;
+					},
+				},
 				bindExtensions: async () => undefined,
-				subscribe: () => () => undefined,
 				prompt: (text: string, options: unknown) => {
 					promptTexts.push(text);
 					promptOptions.push(options);
 					return new Promise<void>((_resolve, reject) => {
 						rejectPrompt = reject;
 					});
+				},
+				steer: async (text: string) => {
+					steeringCalls.push(text);
+					if (text === "race")
+						await new Promise<void>((resolve) => {
+							resolveDelayedSteer = resolve;
+						});
+					steering.push(text);
+					sessionListener?.({ type: "queue_update", steering: [...steering], followUp: [...followUp] });
+					return "queued";
+				},
+				followUp: async (text: string) => {
+					followUp.push(text);
+					sessionListener?.({ type: "queue_update", steering: [...steering], followUp: [...followUp] });
+					return "queued";
+				},
+				getSteeringMessages: () => steering,
+				getFollowUpMessages: () => followUp,
+				clearQueue: () => {
+					const cleared = { steering: [...steering], followUp: [...followUp] };
+					steering.length = 0;
+					followUp.length = 0;
+					sessionListener?.({ type: "queue_update", steering: [], followUp: [] });
+					return cleared;
+				},
+				subscribe: (listener: (event: unknown) => void) => {
+					sessionListener = listener;
+					return () => {
+						sessionListener = undefined;
+					};
 				},
 				abort: async () => undefined,
 			},
@@ -390,23 +435,45 @@ describe("desktop worker protocol and credentials", () => {
 			throw new Error(`Timed out waiting for worker response ${id}`);
 		};
 
-		sendRequest({ id: "init", type: "init", payload: { cwd: process.cwd() } });
+		sendRequest({ id: "init", type: "init", payload: { cwd: process.cwd(), toolMode: "plan" } });
 		expect(await waitResponse("init")).toMatchObject({ ok: true, data: { sessionId: "session-1", messages: [] } });
+		sendRequest({ id: "policy-read", type: "tool.policy.get", payload: {} });
+		expect(await waitResponse("policy-read")).toMatchObject({
+			ok: true,
+			data: { confirmToolCalls: true, mode: "plan" },
+		});
+		sendRequest({ id: "policy-write", type: "tool.policy.set", payload: { confirmToolCalls: false, mode: "build" } });
+		expect(await waitResponse("policy-write")).toMatchObject({
+			ok: true,
+			data: { confirmToolCalls: false, mode: "build" },
+		});
+		expect(sessionEntries).toMatchObject([
+			{ customType: "pi-orbit-tool-policy", data: { mode: "plan" } },
+			{ customType: "pi-orbit-tool-policy", data: { mode: "build" } },
+		]);
 		const imageAttachment = { type: "image", name: "diagram.png", mimeType: "image/png", data: "aGVsbG8=" };
 		const textAttachment = { type: "text", name: "notes.md", text: "see this note" };
 		sendRequest({
 			id: "prompt",
 			type: "prompt",
-			payload: { text: "start", attachments: [imageAttachment, textAttachment] },
+			payload: { text: "start", runId: "run-1", attachments: [imageAttachment, textAttachment] },
 		});
 		expect(await waitResponse("prompt")).toMatchObject({ ok: true, data: { accepted: true } });
 		isStreaming = true;
+		sendRequest({ id: "policy-mode-while-running", type: "tool.policy.set", payload: { mode: "build" } });
+		expect(await waitResponse("policy-mode-while-running")).toMatchObject({
+			ok: false,
+			error: { code: "OPERATION_FAILED", message: "Tool mode can only change while the session is idle" },
+		});
 		sendRequest({
 			id: "message",
 			type: "message",
-			payload: { text: "steer", deliverAs: "steer", attachments: [textAttachment] },
+			payload: { text: "steer", deliverAs: "steer", expectedRunId: "run-1", attachments: [textAttachment] },
 		});
-		expect(await waitResponse("message")).toMatchObject({ ok: true, data: { accepted: true, delivery: "steer" } });
+		expect(await waitResponse("message")).toMatchObject({
+			ok: true,
+			data: { accepted: true, delivery: "steer", disposition: "queued" },
+		});
 		sendRequest({
 			id: "follow-up",
 			type: "message",
@@ -414,28 +481,101 @@ describe("desktop worker protocol and credentials", () => {
 		});
 		expect(await waitResponse("follow-up")).toMatchObject({
 			ok: true,
-			data: { accepted: true, delivery: "followUp" },
+			data: { accepted: true, delivery: "followUp", disposition: "queued" },
+		});
+		expect(steering).toEqual(['steer\n\n<file name="notes.md">\nsee this note\n</file>']);
+		expect(followUp).toEqual(['follow up\n\n<file name="diagram.png"></file>']);
+		expect(sent).toContainEqual({
+			type: "event",
+			event: {
+				type: "queue.update",
+				steering: ['steer\n\n<file name="notes.md">\nsee this note\n</file>'],
+				followUp: ['follow up\n\n<file name="diagram.png"></file>'],
+				pendingCount: 2,
+				truncated: false,
+			},
 		});
 		expect(promptOptions).toEqual([
 			{ source: "rpc", images: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }] },
-			{ source: "rpc", streamingBehavior: "steer" },
-			{
-				source: "rpc",
-				streamingBehavior: "followUp",
-				images: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
-			},
 		]);
 		expect(promptTexts).toEqual([
 			'start\n\n<file name="diagram.png"></file>\n<file name="notes.md">\nsee this note\n</file>',
-			'steer\n\n<file name="notes.md">\nsee this note\n</file>',
-			'follow up\n\n<file name="diagram.png"></file>',
 		]);
+		sendRequest({ id: "queue-get", type: "queue.get", payload: {} });
+		expect(await waitResponse("queue-get")).toMatchObject({
+			ok: true,
+			data: {
+				steering: ['steer\n\n<file name="notes.md">\nsee this note\n</file>'],
+				followUp: ['follow up\n\n<file name="diagram.png"></file>'],
+				pendingCount: 2,
+			},
+		});
+		sendRequest({ id: "queue-clear", type: "queue.clear", payload: {} });
+		expect(await waitResponse("queue-clear")).toMatchObject({
+			ok: true,
+			data: {
+				steering: ['steer\n\n<file name="notes.md">\nsee this note\n</file>'],
+				followUp: ['follow up\n\n<file name="diagram.png"></file>'],
+				pendingCount: 0,
+			},
+		});
+		const longQueuedText = "q".repeat(3_000);
+		steering.push(...Array.from({ length: 51 }, () => longQueuedText));
+		followUp.push("last queued message");
+		sendRequest({ id: "queue-bounded-preview", type: "queue.get", payload: {} });
+		expect(await waitResponse("queue-bounded-preview")).toMatchObject({
+			ok: true,
+			data: {
+				steering: Array.from({ length: 50 }, () => "q".repeat(2_000)),
+				followUp: ["last queued message"],
+				pendingCount: 52,
+				truncated: true,
+			},
+		});
+		sendRequest({ id: "queue-clear-all", type: "queue.clear", payload: {} });
+		const clearedQueue = await waitResponse("queue-clear-all");
+		if (!isRecord(clearedQueue) || !isRecord(clearedQueue.data))
+			throw new Error("Worker did not return cleared queue");
+		const clearedSteering = clearedQueue.data.steering;
+		if (!Array.isArray(clearedSteering) || !clearedSteering.every((item): item is string => typeof item === "string"))
+			throw new Error("Worker returned invalid cleared steering messages");
+		expect(clearedQueue.data.pendingCount).toBe(0);
+		expect(clearedSteering).toHaveLength(51);
+		expect(clearedSteering[0]).toBe(longQueuedText);
+		expect(clearedQueue.data.followUp).toEqual(["last queued message"]);
+		isStreaming = false;
+		sendRequest({ id: "message-after-settle", type: "message", payload: { text: "stale", deliverAs: "steer" } });
+		expect(await waitResponse("message-after-settle")).toMatchObject({
+			ok: false,
+			error: { code: "OPERATION_FAILED", message: "Session is no longer running; keep the message in the editor" },
+		});
+		expect(steeringCalls).toHaveLength(1);
+		expect(steering).toHaveLength(0);
+		isStreaming = true;
 
+		sendRequest({
+			id: "message-after-settle-enqueue",
+			type: "message",
+			payload: { text: "race", deliverAs: "steer", expectedRunId: "run-1" },
+		});
+		for (let attempt = 0; attempt < 100 && resolveDelayedSteer === undefined; attempt++)
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(resolveDelayedSteer).toBeDefined();
 		rejectPrompt?.(new Error("request failed"));
+		isStreaming = false;
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		resolveDelayedSteer?.();
+		expect(await waitResponse("message-after-settle-enqueue")).toMatchObject({
+			ok: true,
+			data: { accepted: true, delivery: "steer", disposition: "queued" },
+		});
+		expect(steeringCalls).toHaveLength(2);
+		expect(steering).toEqual(["race"]);
+		expect(promptTexts).toHaveLength(1);
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(sent).toContainEqual({
 			type: "event",
-			event: { type: "state", state: "failed", sessionId: "session-1", message: "request failed" },
+			event: { type: "state", state: "failed", sessionId: "session-1", runId: "run-1", message: "request failed" },
 		});
 		await host.close();
 	});
@@ -475,7 +615,7 @@ describe("desktop worker protocol and credentials", () => {
 				sessionId: "session-long-history",
 				sessionFile: undefined,
 				model: undefined,
-				sessionManager: { getBranch: () => branch },
+				sessionManager: { getBranch: () => branch, getLeafId: () => branch.at(-1)?.id ?? null },
 				bindExtensions: async () => undefined,
 				subscribe: () => () => undefined,
 				abort: async () => undefined,
@@ -582,7 +722,7 @@ describe("desktop worker protocol and credentials", () => {
 				sessionId: "session-ids",
 				sessionFile: undefined,
 				model: undefined,
-				sessionManager: { getBranch: () => branch },
+				sessionManager: { getBranch: () => branch, getLeafId: () => branch.at(-1)?.id ?? null },
 				bindExtensions: async () => undefined,
 				subscribe: (listener: (event: unknown) => void) => {
 					sessionListener = listener;
@@ -876,6 +1016,201 @@ describe("desktop worker protocol and credentials", () => {
 		await host.close();
 	});
 
+	it("refreshes the selected model object from the current provider catalog", async () => {
+		const sent: unknown[] = [];
+		const listeners = new Set<(value: unknown) => void>();
+		const port: DesktopWorkerPort = {
+			postMessage: (message) => sent.push(message),
+			on: (_event, listener) => {
+				listeners.add(listener);
+				return port;
+			},
+			off: (_event, listener) => {
+				listeners.delete(listener);
+				return port;
+			},
+		};
+		const selectedModel = {
+			provider: "custom-provider",
+			id: "custom-model",
+			name: "Custom model",
+			api: "openai-completions",
+			baseUrl: "https://old.example/v1",
+			contextWindow: 8_000,
+			maxTokens: 1_000,
+			input: ["text"],
+			reasoning: false,
+		} as Model<Api>;
+		const refreshedModel = { ...selectedModel, baseUrl: "https://new.example/v1" };
+		let catalogModel: Model<Api> | undefined = selectedModel;
+		let availability: Model<Api>[] = [selectedModel];
+		let nextCatalogModel: Model<Api> | undefined = refreshedModel;
+		let configured = true;
+		let promptCalls = 0;
+		const refreshOptions: unknown[] = [];
+		const selectedState = { model: selectedModel };
+		const fakeRuntime = {
+			diagnostics: [],
+			services: {
+				modelRuntime: {
+					refresh: async (options: unknown) => {
+						refreshOptions.push(options);
+						catalogModel = nextCatalogModel;
+						availability = nextCatalogModel ? [nextCatalogModel] : [];
+						return { errors: new Map() };
+					},
+					hasConfiguredAuth: () => configured,
+					getModel: () => catalogModel,
+					getModels: () => (catalogModel ? [catalogModel] : []),
+					getAvailableSnapshot: () => availability,
+				},
+			},
+			session: {
+				sessionId: "session-provider-refresh",
+				sessionFile: undefined,
+				get model() {
+					return selectedState.model;
+				},
+				isStreaming: false,
+				agent: { state: selectedState },
+				sessionManager: { getBranch: () => [] },
+				bindExtensions: async () => undefined,
+				subscribe: () => () => undefined,
+				abort: async () => undefined,
+				prompt: async () => {
+					promptCalls++;
+				},
+			},
+			dispose: async () => undefined,
+		};
+		const host = installDesktopWorker(port, {
+			createRuntime: async () => fakeRuntime as unknown as AgentSessionRuntime,
+		});
+		const sendRequest = (message: unknown) => {
+			for (const listener of listeners) listener(message);
+		};
+		const waitResponse = async (id: string): Promise<unknown> => {
+			for (let attempt = 0; attempt < 100; attempt++) {
+				const response = sent.find(
+					(item) => item !== null && typeof item === "object" && "id" in item && item.id === id,
+				);
+				if (response !== undefined) return response;
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			}
+			throw new Error(`Timed out waiting for worker response ${id}`);
+		};
+
+		sendRequest({ id: "init-provider-refresh", type: "init", payload: { cwd: process.cwd() } });
+		await waitResponse("init-provider-refresh");
+		sendRequest({
+			id: "refresh-provider",
+			type: "auth.refresh",
+			payload: { provider: "custom-provider" },
+		});
+		expect(await waitResponse("refresh-provider")).toMatchObject({
+			ok: true,
+			data: {
+				provider: "custom-provider",
+				configured: true,
+				models: [{ provider: "custom-provider", id: "custom-model" }],
+				availableModels: [{ provider: "custom-provider", id: "custom-model" }],
+			},
+		});
+		expect(refreshOptions).toEqual([{ providers: ["custom-provider"], allowNetwork: false }]);
+		expect(selectedState.model).toBe(refreshedModel);
+		expect(selectedState.model?.baseUrl).toBe("https://new.example/v1");
+
+		nextCatalogModel = undefined;
+		configured = false;
+		sendRequest({ id: "remove-provider-model", type: "auth.refresh", payload: { provider: "custom-provider" } });
+		expect(await waitResponse("remove-provider-model")).toMatchObject({
+			ok: true,
+			data: { configured: false, models: [], availableModels: [] },
+		});
+		sendRequest({ id: "prompt-removed-model", type: "prompt", payload: { text: "still selected" } });
+		expect(await waitResponse("prompt-removed-model")).toMatchObject({
+			ok: false,
+			error: {
+				code: "NOT_FOUND",
+				message: "The selected model is no longer configured. Select another model before continuing.",
+			},
+		});
+		expect(promptCalls).toBe(0);
+		await host.close();
+	});
+
+	it("rejects provider refresh while the session is streaming", async () => {
+		const sent: unknown[] = [];
+		const listeners = new Set<(value: unknown) => void>();
+		const port: DesktopWorkerPort = {
+			postMessage: (message) => sent.push(message),
+			on: (_event, listener) => {
+				listeners.add(listener);
+				return port;
+			},
+			off: (_event, listener) => {
+				listeners.delete(listener);
+				return port;
+			},
+		};
+		let refreshCalled = false;
+		const fakeRuntime = {
+			diagnostics: [],
+			services: {
+				modelRuntime: {
+					refresh: async () => {
+						refreshCalled = true;
+						return { errors: new Map() };
+					},
+				},
+			},
+			session: {
+				sessionId: "session-streaming-refresh",
+				sessionFile: undefined,
+				model: undefined,
+				isStreaming: true,
+				sessionManager: { getBranch: () => [] },
+				bindExtensions: async () => undefined,
+				subscribe: () => () => undefined,
+				abort: async () => undefined,
+			},
+			dispose: async () => undefined,
+		};
+		const host = installDesktopWorker(port, {
+			createRuntime: async () => fakeRuntime as unknown as AgentSessionRuntime,
+		});
+		const sendRequest = (message: unknown) => {
+			for (const listener of listeners) listener(message);
+		};
+		const waitResponse = async (id: string): Promise<unknown> => {
+			for (let attempt = 0; attempt < 100; attempt++) {
+				const response = sent.find(
+					(item) => item !== null && typeof item === "object" && "id" in item && item.id === id,
+				);
+				if (response !== undefined) return response;
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			}
+			throw new Error(`Timed out waiting for worker response ${id}`);
+		};
+
+		sendRequest({ id: "init-streaming-refresh", type: "init", payload: { cwd: process.cwd() } });
+		await waitResponse("init-streaming-refresh");
+		sendRequest({
+			id: "refresh-during-stream",
+			type: "auth.refresh",
+			payload: { provider: "custom-provider" },
+		});
+		expect(await waitResponse("refresh-during-stream")).toMatchObject({
+			ok: false,
+			error: {
+				code: "OPERATION_FAILED",
+				message: "Cannot refresh provider configuration while the session is streaming",
+			},
+		});
+		expect(refreshCalled).toBe(false);
+		await host.close();
+	});
+
 	it("acknowledges shutdown only after the session aborts and runtime is disposed", async () => {
 		const sent: unknown[] = [];
 		const listeners = new Set<(value: unknown) => void>();
@@ -966,5 +1301,358 @@ describe("desktop worker protocol and credentials", () => {
 			"dispose:complete",
 			"shutdown:callback",
 		]);
+	});
+
+	it("bridges native session clone, tree, thinking, reload, and rename operations", async () => {
+		const sent: unknown[] = [];
+		const listeners = new Set<(value: unknown) => void>();
+		const port: DesktopWorkerPort = {
+			postMessage: (message) => sent.push(message),
+			on: (_event, listener) => {
+				listeners.add(listener);
+				return port;
+			},
+			off: (_event, listener) => {
+				listeners.delete(listener);
+				return port;
+			},
+		};
+		const userEntry = {
+			type: "message",
+			id: "user-1",
+			parentId: null,
+			message: { role: "user", content: "first question", timestamp: 10 },
+		};
+		const assistantEntry = {
+			type: "message",
+			id: "assistant-1",
+			parentId: "user-1",
+			message: { role: "assistant", content: "answer", timestamp: 20 },
+		};
+		const extraTreeNodes = Array.from({ length: 70 }, (_, index) => ({
+			entry: {
+				type: "message",
+				id: `entry-${index}`,
+				parentId: "assistant-1",
+				message: { role: "assistant", content: `branch entry ${index}`, timestamp: 30 + index },
+			},
+			children: [],
+		}));
+		let leafId: string | null = "assistant-1";
+		let sessionName = "";
+		let currentSessionId = "session-native";
+		let currentSessionFile = "session.jsonl";
+		let thinkingLevel = "off";
+		let navigatedTo = "";
+		let clonedFrom = "";
+		let reloadCount = 0;
+		let cancelNavigation = false;
+		let cancelClone = false;
+		let cancelImport = false;
+		let cancelReplacement = false;
+		let extensionBindCount = 0;
+		let includeManyTreeNodes = false;
+		let replacementCalls = 0;
+		const importCalls: Array<{ sessionFile: string; cwdOverride?: string }> = [];
+		const exportCalls: Array<{ format: string; path: string }> = [];
+		const isStreaming = false;
+		let resolveNavigation!: () => void;
+		let navigationGate: Promise<void> | undefined;
+		const sessionManager = {
+			getBranch: () => [
+				userEntry,
+				assistantEntry,
+				...(leafId === "user-1"
+					? [{ type: "custom", customType: "pi-orbit-tool-policy", data: { mode: "plan" } }]
+					: []),
+			],
+			getTree: () => [
+				{
+					entry: userEntry,
+					children: [
+						{
+							entry: assistantEntry,
+							children: includeManyTreeNodes ? extraTreeNodes : [],
+							label: "Answer",
+						},
+					],
+				},
+			],
+			getLeafId: () => leafId,
+		};
+		const fakeRuntime = {
+			diagnostics: [],
+			services: { modelRuntime: { getModel: () => undefined } },
+			session: {
+				get sessionId() {
+					return currentSessionId;
+				},
+				get sessionFile() {
+					return currentSessionFile;
+				},
+				get sessionName() {
+					return sessionName;
+				},
+				model: undefined,
+				sessionManager,
+				get isStreaming() {
+					return isStreaming;
+				},
+				get thinkingLevel() {
+					return thinkingLevel;
+				},
+				getAvailableThinkingLevels: () => ["off", "low", "high"],
+				setThinkingLevel: (level: string) => {
+					thinkingLevel = level;
+				},
+				setSessionName: (name: string) => {
+					sessionName = name;
+				},
+				navigateTree: async (entryId: string) => {
+					navigatedTo = entryId;
+					await navigationGate;
+					if (cancelNavigation) return { cancelled: true };
+					leafId = entryId;
+					return { cancelled: false, editorText: entryId === "user-1" ? "first question" : undefined };
+				},
+				bindExtensions: async () => {
+					extensionBindCount++;
+				},
+				subscribe: () => () => undefined,
+				abort: async () => undefined,
+				compact: async () => ({ compacted: true }),
+				exportToHtml: async (path: string) => {
+					exportCalls.push({ format: "html", path });
+					return path;
+				},
+				exportToJsonl: (path: string) => {
+					exportCalls.push({ format: "jsonl", path });
+					return path;
+				},
+				reload: async () => {
+					reloadCount++;
+				},
+			},
+			fork: async (entryId: string, options: { position?: string }) => {
+				clonedFrom = entryId;
+				expect(options).toEqual({ position: "at" });
+				return { cancelled: cancelClone };
+			},
+			importFromJsonl: async (sessionFile: string, cwdOverride?: string) => {
+				importCalls.push({ sessionFile, ...(cwdOverride === undefined ? {} : { cwdOverride }) });
+				if (cancelImport) return { cancelled: true };
+				currentSessionId = "session-imported";
+				currentSessionFile = "imported.jsonl";
+				sessionName = "Imported session";
+				return { cancelled: false };
+			},
+			newSession: async () => {
+				replacementCalls++;
+				return { cancelled: cancelReplacement };
+			},
+			switchSession: async (_sessionFile: string) => {
+				replacementCalls++;
+				return { cancelled: cancelReplacement };
+			},
+			dispose: async () => undefined,
+		};
+		const host = installDesktopWorker(port, {
+			createRuntime: async () => fakeRuntime as unknown as AgentSessionRuntime,
+		});
+		const sendRequest = (message: unknown) => {
+			for (const listener of listeners) listener(message);
+		};
+		const waitResponse = async (id: string): Promise<Record<string, unknown>> => {
+			for (let attempt = 0; attempt < 100; attempt++) {
+				const response = sent.find(
+					(item) => item !== null && typeof item === "object" && "id" in item && item.id === id,
+				);
+				if (isRecord(response)) return response;
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			}
+			throw new Error(`Timed out waiting for worker response ${id}`);
+		};
+
+		sendRequest({ id: "init-native", type: "init", payload: { cwd: process.cwd() } });
+		expect(await waitResponse("init-native")).toMatchObject({ ok: true });
+		sendRequest({ id: "policy-before-navigation", type: "tool.policy.get", payload: {} });
+		expect(await waitResponse("policy-before-navigation")).toMatchObject({
+			ok: true,
+			data: { mode: "build" },
+		});
+		sendRequest({ id: "tree-native", type: "tree.get", payload: {} });
+		expect(await waitResponse("tree-native")).toMatchObject({
+			ok: true,
+			data: {
+				leafId: "assistant-1",
+				entries: [
+					{ id: "user-1", parentId: null, type: "message", role: "user", label: "first question", timestamp: 10 },
+					{
+						id: "assistant-1",
+						parentId: "user-1",
+						type: "message",
+						role: "assistant",
+						label: "Answer",
+						timestamp: 20,
+					},
+				],
+			},
+		});
+		includeManyTreeNodes = true;
+		leafId = "entry-69";
+		sendRequest({ id: "tree-many-entries", type: "tree.get", payload: {} });
+		const manyEntries = await waitResponse("tree-many-entries");
+		if (!isRecord(manyEntries.data) || !Array.isArray(manyEntries.data.entries))
+			throw new Error("Worker did not return the full session tree");
+		expect(manyEntries.data.entries).toHaveLength(72);
+		expect(manyEntries.data.leafId).toBe("entry-69");
+		expect(manyEntries.data.entries.at(-1)).toMatchObject({ id: "entry-69", parentId: "assistant-1" });
+		includeManyTreeNodes = false;
+		leafId = "assistant-1";
+		sendRequest({ id: "tree-navigate", type: "tree.navigate", payload: { entryId: "user-1" } });
+		expect(await waitResponse("tree-navigate")).toMatchObject({
+			ok: true,
+			data: { cancelled: false, editorText: "first question", leafId: "user-1", sessionId: "session-native" },
+		});
+		expect(navigatedTo).toBe("user-1");
+		sendRequest({ id: "policy-after-navigation", type: "tool.policy.get", payload: {} });
+		expect(await waitResponse("policy-after-navigation")).toMatchObject({
+			ok: true,
+			data: { mode: "plan" },
+		});
+		sendRequest({ id: "tree-clone", type: "clone", payload: {} });
+		expect(await waitResponse("tree-clone")).toMatchObject({
+			ok: true,
+			data: { cancelled: false, sessionId: "session-native" },
+		});
+		expect(clonedFrom).toBe("user-1");
+		const bindingsAfterClone = extensionBindCount;
+		cancelClone = true;
+		leafId = "assistant-1";
+		sendRequest({ id: "tree-clone-cancelled", type: "clone", payload: {} });
+		expect(await waitResponse("tree-clone-cancelled")).toMatchObject({
+			ok: true,
+			data: { cancelled: true, sessionId: "session-native" },
+		});
+		expect(extensionBindCount).toBe(bindingsAfterClone);
+		cancelClone = false;
+		sendRequest({ id: "thinking-read", type: "thinking.get", payload: {} });
+		expect(await waitResponse("thinking-read")).toMatchObject({
+			ok: true,
+			data: { level: "off", availableLevels: ["off", "low", "high"] },
+		});
+		sendRequest({ id: "thinking-write", type: "thinking.set", payload: { level: "high" } });
+		expect(await waitResponse("thinking-write")).toMatchObject({ ok: true, data: { level: "high" } });
+		expect(thinkingLevel).toBe("high");
+		sendRequest({ id: "reload-native", type: "resources.reload", payload: {} });
+		expect(await waitResponse("reload-native")).toMatchObject({ ok: true, data: { reloaded: true } });
+		expect(reloadCount).toBe(1);
+		sendRequest({ id: "rename-native", type: "session.rename", payload: { title: "Review" } });
+		expect(await waitResponse("rename-native")).toMatchObject({ ok: true, data: { renamed: true } });
+		expect(sessionName).toBe("Review");
+		const bindingsBeforeReplacement = extensionBindCount;
+		cancelReplacement = true;
+		sendRequest({ id: "new-cancelled", type: "new", payload: {} });
+		expect(await waitResponse("new-cancelled")).toMatchObject({ ok: true, data: { cancelled: true } });
+		expect(extensionBindCount).toBe(bindingsBeforeReplacement);
+		cancelReplacement = false;
+		sendRequest({ id: "new-native", type: "new", payload: {} });
+		expect(await waitResponse("new-native")).toMatchObject({ ok: true, data: { cancelled: false } });
+		sendRequest({ id: "switch-native", type: "switch", payload: { sessionFile: "next-session.jsonl" } });
+		expect(await waitResponse("switch-native")).toMatchObject({ ok: true, data: { cancelled: false } });
+		expect(replacementCalls).toBe(3);
+		leafId = null;
+		sendRequest({ id: "tree-clone-empty", type: "clone", payload: {} });
+		expect(await waitResponse("tree-clone-empty")).toMatchObject({
+			ok: false,
+			error: { code: "NOT_FOUND", message: "Session has no entry to clone" },
+		});
+		leafId = "user-1";
+		cancelNavigation = true;
+		sendRequest({ id: "tree-navigate-cancelled", type: "tree.navigate", payload: { entryId: "assistant-1" } });
+		expect(await waitResponse("tree-navigate-cancelled")).toMatchObject({
+			ok: true,
+			data: { cancelled: true, leafId: "user-1" },
+		});
+		cancelNavigation = false;
+		const bindingsBeforeImport = extensionBindCount;
+		cancelImport = true;
+		sendRequest({
+			id: "import-cancelled",
+			type: "session.import",
+			payload: { sessionFile: "source.jsonl", cwdOverride: "C:/project" },
+		});
+		expect(await waitResponse("import-cancelled")).toMatchObject({
+			ok: true,
+			data: { cancelled: true, sessionId: "session-native" },
+		});
+		expect(extensionBindCount).toBe(bindingsBeforeImport);
+		cancelImport = false;
+		sendRequest({
+			id: "import-session",
+			type: "session.import",
+			payload: { sessionFile: "source.jsonl", cwdOverride: "C:/project" },
+		});
+		expect(await waitResponse("import-session")).toMatchObject({
+			ok: true,
+			data: {
+				cancelled: false,
+				sessionId: "session-imported",
+				sessionFile: "imported.jsonl",
+				sessionName: "Imported session",
+			},
+		});
+		expect(importCalls).toEqual([
+			{ sessionFile: "source.jsonl", cwdOverride: "C:/project" },
+			{ sessionFile: "source.jsonl", cwdOverride: "C:/project" },
+		]);
+		expect(extensionBindCount).toBe(bindingsBeforeImport + 1);
+		sendRequest({
+			id: "export-html",
+			type: "session.export",
+			payload: { path: "export.html", format: "html" },
+		});
+		expect(await waitResponse("export-html")).toMatchObject({
+			ok: true,
+			data: { path: "export.html", format: "html" },
+		});
+		sendRequest({
+			id: "export-jsonl",
+			type: "session.export",
+			payload: { path: "export.jsonl", format: "jsonl" },
+		});
+		expect(await waitResponse("export-jsonl")).toMatchObject({
+			ok: true,
+			data: { path: "export.jsonl", format: "jsonl" },
+		});
+		expect(exportCalls).toEqual([
+			{ format: "html", path: "export.html" },
+			{ format: "jsonl", path: "export.jsonl" },
+		]);
+
+		navigationGate = new Promise<void>((resolve) => {
+			resolveNavigation = resolve;
+		});
+		sendRequest({ id: "tree-navigate-pending", type: "tree.navigate", payload: { entryId: "assistant-1" } });
+		for (let attempt = 0; attempt < 100 && navigatedTo !== "assistant-1"; attempt++)
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		sendRequest({ id: "prompt-during-navigation", type: "prompt", payload: { text: "must wait" } });
+		expect(await waitResponse("prompt-during-navigation")).toMatchObject({
+			ok: false,
+			error: { code: "OPERATION_FAILED", message: "Session state is being updated" },
+		});
+		sendRequest({ id: "thinking-during-navigation", type: "thinking.set", payload: { level: "low" } });
+		expect(await waitResponse("thinking-during-navigation")).toMatchObject({
+			ok: false,
+			error: { code: "OPERATION_FAILED", message: "Wait for the current session operation to finish" },
+		});
+		sendRequest({ id: "switch-during-navigation", type: "switch", payload: { sessionFile: "blocked.jsonl" } });
+		expect(await waitResponse("switch-during-navigation")).toMatchObject({
+			ok: false,
+			error: { code: "OPERATION_FAILED", message: "Wait for the current session operation to finish" },
+		});
+		resolveNavigation();
+		expect(await waitResponse("tree-navigate-pending")).toMatchObject({ ok: true });
+		await host.close();
 	});
 });

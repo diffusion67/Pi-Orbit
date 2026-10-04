@@ -147,6 +147,29 @@ async function settled<T>(load: () => Promise<T>, check: (value: T) => boolean, 
 	throw new Error("Timed out waiting for a worker event");
 }
 
+async function enableSubagents(service: DesktopAppService, maxParallelTasks?: number): Promise<void> {
+	const settings = (await service.snapshot()).settings;
+	const result = await service.invoke("settings.save", {
+		...settings,
+		subagentsEnabled: true,
+		...(maxParallelTasks === undefined ? {} : { maxParallelTasks }),
+	});
+	assert.equal(result.ok, true);
+}
+
+async function setSubagentsEnabled(service: DesktopAppService, enabled: boolean): Promise<void> {
+	const settings = (await service.snapshot()).settings;
+	const result = await service.invoke("settings.save", { ...settings, subagentsEnabled: enabled });
+	assert.equal(result.ok, true);
+}
+
+function workerTeamToolsEnabled(worker: FakeWorker | undefined): boolean | undefined {
+	const payload = worker?.requests.find((request) => request.type === "init")?.payload;
+	return payload && typeof payload === "object" && "enableTeamTools" in payload
+		? Boolean(payload.enableTeamTools)
+		: undefined;
+}
+
 afterEach(async () => {
 	for (const root of temporaryRoots.splice(0))
 		await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 20 });
@@ -186,6 +209,7 @@ describe("desktop app service", () => {
 		try {
 			const opened = await service.invoke("project.open", { path: paths.projectPath });
 			assert.ok(opened.ok);
+			await enableSubagents(service);
 			assert.ok(
 				(
 					await service.invoke("role.save", {
@@ -299,6 +323,7 @@ describe("desktop app service", () => {
 			try {
 				const opened = await service.invoke("project.open", { path: paths.projectPath });
 				assert.ok(opened.ok);
+				await enableSubagents(service);
 				const projectId = (opened.data as { id: string }).id;
 				assert.ok(
 					(
@@ -401,6 +426,7 @@ describe("desktop app service", () => {
 		try {
 			const opened = await service.invoke("project.open", { path: paths.projectPath });
 			assert.ok(opened.ok);
+			await enableSubagents(service);
 			assert.ok(
 				(
 					await service.invoke("role.save", {
@@ -456,6 +482,7 @@ describe("desktop app service", () => {
 		try {
 			const opened = await service.invoke("project.open", { path: paths.projectPath });
 			assert.ok(opened.ok);
+			await enableSubagents(service);
 			assert.ok(
 				(
 					await service.invoke("role.save", {
@@ -519,6 +546,7 @@ describe("desktop app service", () => {
 		try {
 			const opened = await service.invoke("project.open", { path: paths.projectPath });
 			assert.ok(opened.ok);
+			await enableSubagents(service);
 			const projectId = (opened.data as { id: string }).id;
 			assert.ok(
 				(
@@ -586,6 +614,7 @@ describe("desktop app service", () => {
 		try {
 			const opened = await service.invoke("project.open", { path: paths.projectPath });
 			assert.ok(opened.ok);
+			await enableSubagents(service);
 			const projectId = (opened.data as { id: string }).id;
 			assert.ok(
 				(
@@ -777,6 +806,8 @@ describe("desktop app service", () => {
 			defaultModel: "orbit-smoke/smoke",
 			confirmToolCalls: false,
 			sendShortcut: "ctrlEnter",
+			subagentsEnabled: false,
+			maxParallelTasks: 4,
 		};
 		const createService = () =>
 			DesktopAppService.open({
@@ -792,6 +823,8 @@ describe("desktop app service", () => {
 				defaultModel: "",
 				confirmToolCalls: true,
 				sendShortcut: "enter",
+				subagentsEnabled: false,
+				maxParallelTasks: 4,
 			});
 			assert.deepEqual(await service.invoke("settings.save", { ...expected, language: "fr" }), {
 				ok: false,
@@ -832,7 +865,242 @@ describe("desktop app service", () => {
 				defaultModel: "legacy/model",
 				confirmToolCalls: false,
 				sendShortcut: "enter",
+				subagentsEnabled: false,
+				maxParallelTasks: 4,
 			});
+		} finally {
+			await service.close();
+		}
+	});
+
+	it("keeps subagents disabled by default and denies task creation and resume until enabled", async () => {
+		const paths = await repository();
+		const workers: FakeWorker[] = [];
+		const service = await DesktopAppService.open({
+			dataDirectory: paths.dataDirectory,
+			agentDirectory: paths.agentDirectory,
+			createWorkerTransport: () => {
+				const worker = new FakeWorker();
+				workers.push(worker);
+				return worker;
+			},
+		});
+		try {
+			const opened = await service.invoke("project.open", { path: paths.projectPath });
+			assert.equal(opened.ok, true);
+			if (!opened.ok) return;
+			const projectId = (opened.data as { id: string }).id;
+			assert.equal((await service.snapshot()).settings.subagentsEnabled, false);
+			assert.equal(
+				(
+					await service.invoke("role.save", {
+						id: "user:coder",
+						name: "Coder",
+						description: "Edits a project",
+						systemPrompt: "Make focused changes.",
+						model: "",
+						tools: ["read", "write"],
+						scope: "user",
+					})
+				).ok,
+				true,
+			);
+			const session = await service.invoke("session.create", { projectId });
+			assert.equal(session.ok, true);
+			if (!session.ok) return;
+			const sessionId = (session.data as { id: string }).id;
+			assert.equal((await service.invoke("session.select", { sessionId })).ok, true);
+			const mainWorker = workers.at(-1);
+			assert.equal(workerTeamToolsEnabled(mainWorker), false);
+			mainWorker?.emit({ type: "main.request", requestId: "disabled-roles", action: "team.roles", payload: {} });
+			const rolesReply = await settled(
+				async () =>
+					mainWorker?.requests.find((request) => {
+						const payload = request.payload;
+						return (
+							request.type === "main.resolve" &&
+							payload &&
+							typeof payload === "object" &&
+							"requestId" in payload &&
+							payload.requestId === "disabled-roles"
+						);
+					}),
+				(request) => request !== undefined,
+			);
+			assert.equal((rolesReply?.payload as { error: { code: string } }).error.code, "SUBAGENTS_DISABLED");
+			mainWorker?.emit({
+				type: "main.request",
+				requestId: "disabled-create",
+				action: "task.create",
+				payload: { roleId: "user:coder", prompt: "Must stay disabled", dependsOn: [] },
+			});
+			const createToolReply = await settled(
+				async () =>
+					mainWorker?.requests.find((request) => {
+						const payload = request.payload;
+						return (
+							request.type === "main.resolve" &&
+							payload &&
+							typeof payload === "object" &&
+							"requestId" in payload &&
+							payload.requestId === "disabled-create"
+						);
+					}),
+				(request) => request !== undefined,
+			);
+			assert.equal((createToolReply?.payload as { error: { code: string } }).error.code, "SUBAGENTS_DISABLED");
+
+			const deniedCreate = await service.invoke("task.create", {
+				projectId,
+				roleId: "user:coder",
+				prompt: "Must remain disabled",
+				dependsOn: [],
+			});
+			assert.equal(deniedCreate.ok, false);
+			if (!deniedCreate.ok) assert.equal(deniedCreate.code, "SUBAGENTS_DISABLED");
+
+			await enableSubagents(service);
+			const created = await service.invoke("task.create", {
+				projectId,
+				roleId: "user:coder",
+				prompt: "Pause before disabling",
+				dependsOn: [],
+			});
+			assert.equal(created.ok, true);
+			if (!created.ok) return;
+			const taskId = (created.data as { id: string }).id;
+			assert.equal((await service.invoke("task.pause", { taskId })).ok, true);
+			await setSubagentsEnabled(service, false);
+			const deniedResume = await service.invoke("task.resume", { taskId });
+			assert.equal(deniedResume.ok, false);
+			if (!deniedResume.ok) assert.equal(deniedResume.code, "SUBAGENTS_DISABLED");
+		} finally {
+			await service.close();
+		}
+	});
+
+	it("restarts idle session workers when the subagent setting changes", async () => {
+		const paths = await repository();
+		const workers: FakeWorker[] = [];
+		const service = await DesktopAppService.open({
+			dataDirectory: paths.dataDirectory,
+			agentDirectory: paths.agentDirectory,
+			createWorkerTransport: () => {
+				const worker = new FakeWorker();
+				workers.push(worker);
+				return worker;
+			},
+		});
+		try {
+			const opened = await service.invoke("project.open", { path: paths.projectPath });
+			assert.equal(opened.ok, true);
+			if (!opened.ok) return;
+			const created = await service.invoke("session.create", { projectId: (opened.data as { id: string }).id });
+			assert.equal(created.ok, true);
+			if (!created.ok) return;
+			const sessionId = (created.data as { id: string }).id;
+			assert.equal((await service.invoke("session.select", { sessionId })).ok, true);
+			assert.equal(workerTeamToolsEnabled(workers.at(-1)), false);
+			const liveWorker = workers.at(-1)!;
+			liveWorker.emit({ type: "state", state: "streaming" });
+			await settled(
+				() => service.snapshot(),
+				(snapshot) => snapshot.sessions.find((session) => session.id === sessionId)?.status === "running",
+			);
+			const settings = (await service.snapshot()).settings;
+			const rejectedChange = await service.invoke("settings.save", { ...settings, subagentsEnabled: true });
+			assert.equal(rejectedChange.ok, false);
+			if (!rejectedChange.ok) assert.equal(rejectedChange.code, "SESSION_BUSY");
+			liveWorker.emit({ type: "state", state: "idle" });
+			await settled(
+				() => service.snapshot(),
+				(snapshot) => snapshot.sessions.find((session) => session.id === sessionId)?.status === "idle",
+			);
+
+			await setSubagentsEnabled(service, true);
+			assert.equal(workers.length, 3);
+			assert.equal(workerTeamToolsEnabled(workers.at(-1)), true);
+			await setSubagentsEnabled(service, false);
+			assert.equal(workers.length, 4);
+			assert.equal(workerTeamToolsEnabled(workers.at(-1)), false);
+			assert.equal((await service.snapshot()).activeSessionId, sessionId);
+		} finally {
+			await service.close();
+		}
+	});
+
+	it("limits task admission and keeps queued work stopped after subagents are disabled", async () => {
+		const paths = await repository();
+		const workers: FakeWorker[] = [];
+		const service = await DesktopAppService.open({
+			dataDirectory: paths.dataDirectory,
+			agentDirectory: paths.agentDirectory,
+			createWorkerTransport: () => {
+				const worker = new FakeWorker();
+				workers.push(worker);
+				return worker;
+			},
+		});
+		try {
+			const opened = await service.invoke("project.open", { path: paths.projectPath });
+			assert.equal(opened.ok, true);
+			if (!opened.ok) return;
+			const projectId = (opened.data as { id: string }).id;
+			await enableSubagents(service, 1);
+			assert.equal(
+				(
+					await service.invoke("role.save", {
+						id: "user:coder",
+						name: "Coder",
+						description: "Edits a project",
+						systemPrompt: "Make focused changes.",
+						model: "",
+						tools: ["read", "write"],
+						scope: "user",
+					})
+				).ok,
+				true,
+			);
+			const tasks: string[] = [];
+			for (let index = 0; index < 4; index++) {
+				const created = await service.invoke("task.create", {
+					projectId,
+					roleId: "user:coder",
+					prompt: `Task ${index}`,
+					dependsOn: [],
+				});
+				assert.equal(created.ok, true);
+				if (created.ok) tasks.push((created.data as { id: string }).id);
+			}
+			let snapshot = await service.snapshot();
+			assert.equal(snapshot.tasks.find((task) => task.id === tasks[0])?.status, "running");
+			assert.equal(snapshot.tasks.find((task) => task.id === tasks[1])?.status, "queued");
+			assert.equal((await service.invoke("task.pause", { taskId: tasks[0]! })).ok, true);
+			snapshot = await settled(
+				() => service.snapshot(),
+				(value) => value.tasks.find((task) => task.id === tasks[1])?.status === "running",
+			);
+			assert.equal(snapshot.tasks.find((task) => task.id === tasks[0])?.status, "paused");
+			const deniedResume = await service.invoke("task.resume", { taskId: tasks[0]! });
+			assert.equal(deniedResume.ok, false);
+			if (!deniedResume.ok) assert.equal(deniedResume.code, "CONCURRENCY_LIMIT");
+
+			await setSubagentsEnabled(service, false);
+			assert.equal(snapshot.tasks.find((task) => task.id === tasks[1])?.status, "running");
+			const deniedCreate = await service.invoke("task.create", {
+				projectId,
+				roleId: "user:coder",
+				prompt: "Must stay queued",
+				dependsOn: [],
+			});
+			assert.equal(deniedCreate.ok, false);
+			if (!deniedCreate.ok) assert.equal(deniedCreate.code, "SUBAGENTS_DISABLED");
+			assert.equal((await service.invoke("task.pause", { taskId: tasks[1]! })).ok, true);
+			assert.equal((await service.invoke("task.cancel", { taskId: tasks[1]! })).ok, true);
+			snapshot = await service.snapshot();
+			assert.equal(snapshot.tasks.find((task) => task.id === tasks[1])?.status, "cancelled");
+			assert.equal(snapshot.tasks.find((task) => task.id === tasks[2])?.status, "queued");
+			assert.equal(snapshot.tasks.find((task) => task.id === tasks[3])?.status, "queued");
 		} finally {
 			await service.close();
 		}
@@ -878,6 +1146,27 @@ describe("desktop app service", () => {
 				(snapshot) => snapshot.messages.some((message) => message.id === "tool:read-1"),
 			);
 			assert.equal(withTool.messages.find((message) => message.id === "tool:read-1")?.parts[0]?.kind, "tool");
+			const liveWorker = workers.at(-1)!;
+			liveWorker.historyMessages = [
+				{
+					type: "message",
+					entryId: "tool:read-1",
+					role: "assistant",
+					text: "Read file.txt",
+					parts: [
+						{
+							kind: "tool",
+							name: "read",
+							status: "complete",
+							input: '{"path":"file.txt"}',
+							output: "before",
+						},
+					],
+				},
+			];
+			assert.equal((await service.invoke("session.select", { sessionId: id })).ok, true);
+			const reselected = await service.snapshot();
+			assert.equal(reselected.messages.filter((message) => message.id === "tool:read-1").length, 1);
 			const beforeUi = withTool.lastEventSeq;
 			workers.at(-1)?.emit({ type: "ui.update", update: "status", key: "build", message: "Running" });
 			workers.at(-1)?.emit({ type: "ui.update", update: "editor", mode: "replace", message: "draft" });
@@ -977,6 +1266,8 @@ describe("desktop app service", () => {
 						defaultModel: "orbit-smoke/smoke",
 						confirmToolCalls: true,
 						sendShortcut: "enter",
+						subagentsEnabled: false,
+						maxParallelTasks: 4,
 					})
 				).ok,
 				true,
@@ -1210,6 +1501,7 @@ describe("desktop app service", () => {
 			const opened = await service.invoke("project.open", { path: paths.projectPath });
 			assert.equal(opened.ok, true);
 			if (!opened.ok) return;
+			await enableSubagents(service);
 			const projectId = (opened.data as { id: string }).id;
 			const role = await service.invoke("role.save", {
 				id: "new",
@@ -1264,6 +1556,7 @@ describe("desktop app service", () => {
 			const opened = await service.invoke("project.open", { path: nestedProjectPath });
 			assert.equal(opened.ok, true);
 			if (!opened.ok) return;
+			await enableSubagents(service);
 			const projectId = (opened.data as { id: string }).id;
 			const role = await service.invoke("role.save", {
 				id: "new",
@@ -1304,6 +1597,7 @@ describe("desktop app service", () => {
 			const opened = await service.invoke("project.open", { path: paths.projectPath });
 			assert.equal(opened.ok, true);
 			if (!opened.ok) return;
+			await enableSubagents(service);
 			const project = opened.data as { id: string };
 			const role = await service.invoke("role.save", {
 				id: "user:coder",
@@ -1380,6 +1674,7 @@ describe("desktop app service", () => {
 			const opened = await service.invoke("project.open", { path: paths.projectPath });
 			assert.equal(opened.ok, true);
 			if (!opened.ok) return;
+			await enableSubagents(service);
 			const projectId = (opened.data as { id: string }).id;
 			const role = await service.invoke("role.save", {
 				id: "user:coder",
@@ -1428,6 +1723,66 @@ describe("desktop app service", () => {
 		}
 	});
 
+	it("continues scheduling after a settled worker cannot be stopped", async () => {
+		const paths = await repository();
+		const workers: FakeWorker[] = [];
+		const service = await DesktopAppService.open({
+			...paths,
+			createWorkerTransport: () => {
+				const worker = new FakeWorker();
+				workers.push(worker);
+				return worker;
+			},
+		});
+		try {
+			const opened = await service.invoke("project.open", { path: paths.projectPath });
+			assert.ok(opened.ok);
+			await enableSubagents(service, 1);
+			assert.ok(
+				(
+					await service.invoke("role.save", {
+						id: "user:coder",
+						name: "Coder",
+						description: "",
+						systemPrompt: "Work",
+						model: "",
+						tools: [],
+						scope: "user",
+					})
+				).ok,
+			);
+			const tasks: string[] = [];
+			for (let index = 0; index < 2; index++) {
+				const created = await service.invoke("task.create", {
+					projectId: (opened.data as { id: string }).id,
+					roleId: "user:coder",
+					prompt: `Task ${index}`,
+					dependsOn: [],
+				});
+				assert.ok(created.ok);
+				tasks.push((created.data as { id: string }).id);
+			}
+			const events: DesktopEvent[] = [];
+			await service.subscribe((await service.snapshot()).lastEventSeq, (event) => events.push(event));
+			const worker = workers[0]!;
+			const kill = worker.kill.bind(worker);
+			worker.kill = () => {
+				worker.kill = kill;
+				throw new Error("Worker stop failed");
+			};
+			worker.emit({ type: "state", state: "failed", message: "Task failed" });
+			const snapshot = await settled(
+				() => service.snapshot(),
+				(value) => value.tasks.find((task) => task.id === tasks[1])?.status === "running",
+			);
+			assert.equal(snapshot.tasks.find((task) => task.id === tasks[0])?.status, "failed");
+			assert.ok(events.some((event) => event.type === "diagnostic" && event.code === "TASK_STOP_FAILED"));
+			assert.equal(workers[1]?.requests.filter((request) => request.type === "prompt").length, 1);
+		} finally {
+			await service.close();
+		}
+	});
+
 	it("fills queued slots after pausing and cancelling running tasks", async () => {
 		const paths = await repository();
 		const workers: FakeWorker[] = [];
@@ -1444,6 +1799,7 @@ describe("desktop app service", () => {
 			const opened = await service.invoke("project.open", { path: paths.projectPath });
 			assert.equal(opened.ok, true);
 			if (!opened.ok) return;
+			await enableSubagents(service);
 			const role = await service.invoke("role.save", {
 				id: "user:coder",
 				name: "Coder",
@@ -1505,6 +1861,7 @@ describe("desktop app service", () => {
 			const opened = await service.invoke("project.open", { path: paths.projectPath });
 			assert.equal(opened.ok, true);
 			if (!opened.ok) return;
+			await enableSubagents(service);
 			const projectId = (opened.data as { id: string }).id;
 			const role = await service.invoke("role.save", {
 				id: "user:coder",
@@ -1575,6 +1932,7 @@ describe("desktop app service", () => {
 			const opened = await service.invoke("project.open", { path: paths.projectPath });
 			assert.equal(opened.ok, true);
 			if (!opened.ok) return;
+			await enableSubagents(service);
 			const role = await service.invoke("role.save", {
 				id: "user:coder",
 				name: "Coder",
@@ -1645,6 +2003,7 @@ describe("desktop app service", () => {
 			const opened = await service.invoke("project.open", { path: paths.projectPath });
 			assert.equal(opened.ok, true);
 			if (!opened.ok) return;
+			await enableSubagents(service);
 			const projectId = (opened.data as { id: string }).id;
 			assert.equal(
 				(
@@ -1735,6 +2094,21 @@ describe("desktop app service", () => {
 				action: "task.wait",
 				payload: { taskId, timeoutMs: 2_000 },
 			});
+			childWorker.emit({ type: "state", state: "streaming" });
+			childWorker.emit({ type: "ui.update", update: "status", key: "progress", message: "Still running" });
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			assert.equal(
+				rootWorker.requests.some(
+					(request) =>
+						request.type === "main.resolve" &&
+						request.payload &&
+						typeof request.payload === "object" &&
+						"requestId" in request.payload &&
+						request.payload.requestId === "wait-1",
+				),
+				false,
+				"running state and progress updates must not settle task.wait",
+			);
 			childWorker.emit({ type: "state", state: "idle" });
 			const waitReply = await settled(
 				async () =>
@@ -1749,6 +2123,25 @@ describe("desktop app service", () => {
 				(request) => request !== undefined,
 			);
 			assert.equal((waitReply?.payload as { result: { status: string } }).result.status, "completed");
+			rootWorker.emit({
+				type: "main.request",
+				requestId: "wait-completed",
+				action: "task.wait",
+				payload: { taskId, timeoutMs: 2_000 },
+			});
+			const completedReply = await settled(
+				async () =>
+					rootWorker.requests.find(
+						(request) =>
+							request.type === "main.resolve" &&
+							request.payload &&
+							typeof request.payload === "object" &&
+							"requestId" in request.payload &&
+							request.payload.requestId === "wait-completed",
+					),
+				(request) => request !== undefined,
+			);
+			assert.equal((completedReply?.payload as { result: { status: string } }).result.status, "completed");
 		} finally {
 			await service.close();
 		}

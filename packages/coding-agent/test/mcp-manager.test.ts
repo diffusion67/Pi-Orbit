@@ -42,14 +42,16 @@ describe("MCP manager API", () => {
 		vi.unstubAllEnvs();
 	});
 
-	async function setup() {
+	async function setup(
+		config: McpServerEntry["config"] = {
+			url: "https://user:password@example.invalid/mcp?token=secret",
+			headers: { Authorization: "Bearer top-secret" },
+			exposure: "direct",
+		},
+	) {
 		const entry: McpServerEntry = {
 			name: "private-docs",
-			config: {
-				url: "https://user:password@example.invalid/mcp?token=secret",
-				headers: { Authorization: "Bearer top-secret" },
-				exposure: "direct",
-			},
+			config,
 			source: "private-test-config",
 			scope: "global",
 		};
@@ -160,6 +162,21 @@ describe("MCP manager API", () => {
 		expect(harness.session.getCallableToolNames()).toContain("mcp__private_docs__lookup");
 	});
 
+	it("does not advertise provider-auth HTTP servers as OAuth", async () => {
+		const { manager } = await setup({
+			url: "https://example.invalid/mcp",
+			auth: { provider: "private-provider" },
+		});
+
+		expect(manager.getServers()[0]?.usesOAuth).toBe(false);
+		expect(
+			await manager.signIn("private-docs", {
+				showAuthorizationUrl: () => undefined,
+				promptForRedirectUrl: async () => undefined,
+			}),
+		).toEqual({ ok: false, error: 'MCP server "private-docs" does not use OAuth.' });
+	});
+
 	it("validates and persists global add, update, and remove operations with explicit reload status", async () => {
 		const { manager, agentDir, fallbackConfigPath, fallbackConfig } = await setupConfigManager();
 		const path = join(agentDir, "mcp.json");
@@ -220,5 +237,59 @@ describe("MCP manager API", () => {
 			mcpServers: Record<string, unknown>;
 		};
 		expect(unchanged.mcpServers.docs).toEqual({ command: "local-docs", enabled: false });
+	});
+
+	it("treats an active global-server override as project scoped and saves exposure there", async () => {
+		const trusted = await setupConfigManager(true, { docs: { enabled: false, exposure: "deferred" } });
+		const globalPath = join(trusted.agentDir, "mcp.json");
+		const globalConfig = readFileSync(globalPath, "utf8");
+		const projectPath = join(trusted.harness.tempDir, ".pi", "mcp.json");
+
+		expect(trusted.manager.getServers()[0]).toMatchObject({
+			name: "docs",
+			scope: "project",
+			enabled: false,
+			exposure: "deferred",
+		});
+		expect(trusted.manager.setExposure("docs", "direct")).toEqual({ ok: true });
+		expect(readFileSync(globalPath, "utf8")).toBe(globalConfig);
+		expect(JSON.parse(readFileSync(projectPath, "utf8"))).toMatchObject({
+			mcpServers: { docs: { enabled: false, exposure: "direct" } },
+		});
+	});
+
+	it("updates and removes a project override without changing its global server", async () => {
+		const trusted = await setupConfigManager(true, { docs: { enabled: false } });
+		const globalPath = join(trusted.agentDir, "mcp.json");
+		const globalConfig = readFileSync(globalPath, "utf8");
+		const projectPath = join(trusted.harness.tempDir, ".pi", "mcp.json");
+
+		expect(
+			trusted.manager.updateServer("docs", {
+				url: "https://example.invalid/mcp",
+				auth: { provider: "private-provider" },
+			}),
+		).toEqual({
+			ok: false,
+			error: 'MCP server "docs": auth is only allowed in the global mcp.json',
+		});
+		expect(readFileSync(globalPath, "utf8")).toBe(globalConfig);
+		expect(JSON.parse(readFileSync(projectPath, "utf8"))).toMatchObject({
+			mcpServers: { docs: { enabled: false } },
+		});
+
+		expect(trusted.manager.updateServer("docs", { command: "project-docs", enabled: false })).toEqual({
+			ok: true,
+			changed: true,
+			reloadRequired: true,
+		});
+		expect(readFileSync(globalPath, "utf8")).toBe(globalConfig);
+		expect(JSON.parse(readFileSync(projectPath, "utf8"))).toMatchObject({
+			mcpServers: { docs: { command: "project-docs", enabled: false } },
+		});
+
+		expect(trusted.manager.removeServer("docs")).toEqual({ ok: true, changed: true, reloadRequired: true });
+		expect(readFileSync(globalPath, "utf8")).toBe(globalConfig);
+		expect(JSON.parse(readFileSync(projectPath, "utf8"))).toMatchObject({ mcpServers: {} });
 	});
 });

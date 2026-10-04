@@ -79,6 +79,36 @@ describe("TeamTaskStore", () => {
 		});
 	});
 
+	it("prevents direct queued starts from bypassing prerequisite checks", async () => {
+		const { store } = await openStore();
+		await store.createTask(task("prerequisite"));
+		await store.createTask(task("dependent", "project", ["prerequisite"]));
+
+		await expect(store.transitionTask("dependent", "running")).rejects.toThrow(
+			"cannot run before its dependencies complete",
+		);
+		expect((await store.getTask("dependent"))?.status).toBe("queued");
+
+		await store.startReadyTasks("project");
+		await store.transitionTask("prerequisite", "completed");
+		expect((await store.transitionTask("dependent", "running")).status).toBe("running");
+	});
+
+	it("enforces the configured running limit for direct queued starts and resumes", async () => {
+		const { store } = await openStore();
+		for (let index = 0; index < 3; index++) await store.createTask(task(`limited-${index}`));
+		await store.startReadyTasks("project", 2);
+		await expect(store.transitionTask("limited-2", "running", {}, 2)).rejects.toMatchObject({
+			code: "CONCURRENCY_LIMIT",
+		});
+
+		await store.transitionTask("limited-0", "paused");
+		await expect(store.transitionTask("limited-0", "running", {}, 1)).rejects.toMatchObject({
+			code: "CONCURRENCY_LIMIT",
+		});
+		expect((await store.getTask("limited-0"))?.status).toBe("paused");
+	});
+
 	it("rejects self cycles and cross-project dependencies", async () => {
 		const { store } = await openStore();
 		await expect(store.createTask(task("self", "project", ["self"]))).rejects.toMatchObject({

@@ -6,7 +6,8 @@ Linux. Artifacts are attached to the workflow run for 14 days. The workflow
 is triggered by changes to relevant paths on `main`, pull requests, or manual
 dispatch. The artifact-building workflow does not create a Git tag or publish a GitHub Release.
 The dedicated `.github/workflows/desktop-publish-release.yml` can publish the
-explicitly approved unsigned `0.1.0-rc.1` prerelease after the gates below pass. The separate
+new unsigned `0.1.0-rc.2` prerelease after the gates below pass. The previously
+published `0.1.0-rc.1` and its assets remain untouched. The separate
 manual `.github/workflows/desktop-signed-candidate.yml` signs Windows and macOS
 artifacts from reviewed `main` after the protected `desktop-signing` environment
 approves access to its secrets.
@@ -51,14 +52,15 @@ claimed as verified by this workflow.
 The [2026-10-01 three-platform workflow run](https://github.com/diffusion67/Pi-Orbit/actions/runs/36880990428)
 passed the unsigned installed-artifact smokes for source commit
 `90699497275bfb440abb9d73046a57c793cfc8af`. Those results are historical evidence,
-not approval to publish a newer source. The `7fbbd5f4` upstream sync and desktop
-`0.1.0-rc.1` must pass fresh full CI and all three native jobs at the exact same
+not approval to publish a newer source. The Pi upstream revision frozen for this
+integration, `200387122ca450d6387f033949423114a270b96c`, and desktop
+`0.1.0-rc.2` must pass fresh full CI and all three native jobs at the exact same
 current `main` SHA before publication.
 
 ## Approved unsigned prerelease publication
 
 This is a bounded exception for `diffusion67/Pi-Orbit`, desktop version
-`0.1.0-rc.1`, tag `pi-orbit-v0.1.0-rc.1`. The tag intentionally does not match the
+`0.1.0-rc.2`, tag `pi-orbit-v0.1.0-rc.2`. The tag intentionally does not match the
 upstream `v*` npm/binary publication pipeline. It publishes no npm packages,
 R2 objects, website version markers, signing credentials or automatic updates.
 Another version or broader publication behavior requires a separate review.
@@ -116,7 +118,7 @@ or delete evidence.
 ## Signing and notarization
 
 The three-platform push/PR workflow always builds unsigned artifacts and never
-receives signing or notarization secrets. The approved `0.1.0-rc.1` prerelease
+receives signing or notarization secrets. The `0.1.0-rc.2` prerelease
 explicitly distributes these unsigned artifacts and must disclose that
 Windows SmartScreen or macOS Gatekeeper can warn or block installation. It
 does not claim a verified publisher identity or Apple notarization. For a
@@ -171,7 +173,7 @@ checksums from another run or commit.
 Both candidate-build workflows stop at downloadable workflow artifacts.
 The dedicated publisher is the separately authorized path for this one
 unsigned prerelease. Its Chinese notes template is
-[`releases/0.1.0-rc.1.md`](./releases/0.1.0-rc.1.md); source SHA, workflow links,
+[`releases/0.1.0-rc.2.md`](./releases/0.1.0-rc.2.md); source SHA, workflow links,
 verified architecture, asset sizes and hashes are injected from the validated
 run. Template placeholders must never be copied directly into a release.
 

@@ -74,16 +74,15 @@ describe("Together models", () => {
 			medium: null,
 			high: "high",
 			xhigh: null,
-			max: "max",
 		});
 		expect(deepSeekV4.compat).toMatchObject({
 			supportsReasoningEffort: true,
 			thinkingFormat: "together",
 		});
-		expect(getSupportedThinkingLevels(deepSeekV4)).toEqual(["off", "high", "max"]);
+		expect(getSupportedThinkingLevels(deepSeekV4)).toEqual(["off", "high"]);
 	});
 
-	it.each(["off", "high", "max"] as const)("sends the DeepSeek V4 Pro %s reasoning control", async (reasoning) => {
+	it.each(["off", "high"] as const)("sends the DeepSeek V4 Pro %s reasoning control", async (reasoning) => {
 		const model = getModel("together", "deepseek-ai/DeepSeek-V4-Pro-0813");
 		const context = normalizeContext({
 			messages: [{ role: "user", content: "Hello", timestamp: 0 }],

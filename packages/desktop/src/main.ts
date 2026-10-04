@@ -10,6 +10,8 @@ import {
 	utilityProcess,
 } from "electron";
 import { DesktopAppService } from "./main/app-service.ts";
+import { selectProjectDirectory } from "./main/project-dialog.ts";
+import { selectSessionExportFile, selectSessionFile } from "./main/session-dialog.ts";
 import { TerminalService } from "./main/terminal-service.ts";
 import type { WorkerTransport } from "./main/worker-manager.ts";
 import type { DesktopEvent } from "./shared/desktop-types.ts";
@@ -82,6 +84,27 @@ async function createWindow(): Promise<void> {
 			if (window && !window.isDestroyed()) window.webContents.send("pi-orbit:mcp-auth-event", event);
 		},
 		openExternal: (url) => shell.openExternal(url),
+		chooseProjectDirectory: (defaultPath) =>
+			selectProjectDirectory(
+				(options) =>
+					window && !window.isDestroyed()
+						? dialog.showOpenDialog(window, options)
+						: dialog.showOpenDialog(options),
+				defaultPath,
+			),
+		chooseSessionFile: () =>
+			selectSessionFile((options) =>
+				window && !window.isDestroyed() ? dialog.showOpenDialog(window, options) : dialog.showOpenDialog(options),
+			),
+		chooseSessionExportFile: (title, format) =>
+			selectSessionExportFile(
+				(options) =>
+					window && !window.isDestroyed()
+						? dialog.showSaveDialog(window, options)
+						: dialog.showSaveDialog(options),
+				title,
+				format,
+			),
 	});
 	service = appService;
 	installIpc(appService);

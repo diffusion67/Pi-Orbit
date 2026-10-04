@@ -109,12 +109,85 @@ signing/notarization status, and checksums. See the
 
 ## Preferences and data
 
+Use **Open project folder → Browse folders** to select a directory in the
+native Windows, macOS, or Linux folder picker. You can also enter a path
+manually. Canceling the picker keeps the current project unchanged.
+
+In **Settings → Custom providers**, add a provider name and ID, API base URL,
+credential, and one or more model IDs. Supported formats are Anthropic
+Messages, OpenAI Chat Completions (including compatible gateways), OpenAI
+Responses, and OpenAI Codex Responses. Enter the API base URL rather than a
+Chat Completions request URL; for example, use `https://gateway.example/v1`
+for an OpenAI-compatible gateway. The Codex transport uses `/codex/responses`
+and requires an access token containing the ChatGPT account ID.
+
+Each model has a display name, context window, output limit, and optional
+reasoning/image support. Saved models appear in the session, default-model,
+and role selectors. Custom providers can be edited or removed; leaving the
+credential blank while editing preserves the saved key. A provider saved
+without credentials still needs authentication before sending requests.
+Wait for running sessions and tasks to finish before editing provider
+configuration. Removing the selected model requires choosing another model
+before continuing; it does not switch a conversation to another provider.
+
+Connection metadata is stored in Pi's `models.json` and desktop ownership
+IDs in `desktop-custom-providers.json`; credentials stay in `auth.json` and
+are never returned in snapshots. Existing provider entries configured outside
+the desktop app are preserved.
+
 Settings support English and Simplified Chinese (`zh-CN`), Enter or
 Ctrl/⌘+Enter as the send shortcut (Enter by default), system/dark/light
 appearance, and a default model. On macOS, ⌘+Enter is equivalent to
-Ctrl+Enter. The tool-confirmation preference is currently stored but does not
-change behavior: tool execution follows Pi's configured tool policy, and Pi
-Orbit does not add confirmation prompts from that preference.
+Ctrl+Enter. **Confirm tool calls** is enabled by default and prompts before
+each tool call. Changing it applies to live workers without restarting them.
+Dismissed requests and unavailable confirmation UI block the tool call.
+
+Choose **Plan** or **Build** beside the conversation composer while the session
+is idle. Plan adds planning instructions and permits only the built-in read,
+grep, find, ls, tool-search, and team-role discovery tools. Other tools,
+including shell commands and custom tools, are blocked. This is a tool policy,
+not an operating-system sandbox. The selected mode survives worker restart,
+including for an empty session.
+
+The composer shows pending steering and follow-up messages. **Clear queue**
+removes them from Pi and appends the returned text to that session's draft.
+It does not send another message. A successful queued-message acknowledgement
+means Pi accepted the input; it does not promise the current reply has used it.
+
+Subagents are disabled by default, including for preferences saved before this
+setting existed. Enable **Settings → Enable subagents** to expose delegation
+tools and create or resume tasks. Choose a per-project parallel-task limit from
+1 to 4. Changing the switch requires idle main sessions. Disabling it prevents
+new admissions; already running tasks continue, and their history, pause,
+cancel, and merge controls remain available. Raising the limit or enabling the
+switch admits ready queued tasks. Task starts and resumes enforce the same
+dependency and concurrency checks, and settled workers are stopped.
+Cancellation interrupts workers waiting for initialization and retains their
+partial changes for inspection.
+
+Use **Session details** for usage and estimated cost, supported thinking levels,
+session cloning, conversation-branch navigation, resource reload, and manual
+compaction with optional instructions. Branch navigation stays within the same
+Pi session file. A user-message branch can restore text to append to the draft;
+forking from it creates a separate session. Session renames are saved in Pi's
+session metadata as well as the desktop registry.
+
+Archive an idle session from its actions menu. **Archived sessions** shows
+archived conversations and their Restore action. Archiving retains the native
+session file and clears its active selection; restoration does not run it.
+
+**Project changes** compares the current working tree (including staged and
+untracked files), a base branch's merge base, or a selected commit. It displays
+file status, diff line numbers, binary-file notices, and explicit truncation.
+**Ask agent to review** prepares a draft for the selected session. Review does
+not change the real Git index or apply the diff.
+
+The import button beside **Sessions** opens a native JSONL file picker and
+imports into the selected project. The source is preserved; a session ID
+already registered in Orbit must be cloned instead of imported twice. **Session
+details → Export session** saves Pi's native HTML or current-branch JSONL format
+through a native save dialog. No transcript upload is involved. See the
+[native feature comparison](./docs/native-features.md) for remaining boundaries.
 
 Project metadata, application preferences, team task records, event history,
 and delegated-task worktrees live in Electron's local application data
